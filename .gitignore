@@ -1,0 +1,29 @@
+# --- macOS ---
+.DS_Store
+
+# --- Rust ---
+/rust_core/target/
+**/*.rs.bk
+Cargo.lock
+
+# --- Xcode ---
+build/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+
+# --- UniFFI / Generated ---
+# Optional: If you want to force regeneration every time, ignore this.
+# But usually, it's safe to commit it so the project opens cleanly.
+# WarpApp/WarpApp/rust_core.swift
