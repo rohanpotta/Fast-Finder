@@ -419,6 +419,62 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -461,12 +517,18 @@ fileprivate struct FfiConverterString: FfiConverter {
 public struct SearchResult: Equatable, Hashable {
     public var fileName: String
     public var filePath: String
+    public var fileSize: UInt64
+    public var isFolder: Bool
+    public var score: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fileName: String, filePath: String) {
+    public init(fileName: String, filePath: String, fileSize: UInt64, isFolder: Bool, score: Int64) {
         self.fileName = fileName
         self.filePath = filePath
+        self.fileSize = fileSize
+        self.isFolder = isFolder
+        self.score = score
     }
 
     
@@ -484,13 +546,19 @@ public struct FfiConverterTypeSearchResult: FfiConverterRustBuffer {
         return
             try SearchResult(
                 fileName: FfiConverterString.read(from: &buf), 
-                filePath: FfiConverterString.read(from: &buf)
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                isFolder: FfiConverterBool.read(from: &buf), 
+                score: FfiConverterInt64.read(from: &buf)
         )
     }
 
     public static func write(_ value: SearchResult, into buf: inout [UInt8]) {
         FfiConverterString.write(value.fileName, into: &buf)
         FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterBool.write(value.isFolder, into: &buf)
+        FfiConverterInt64.write(value.score, into: &buf)
     }
 }
 
@@ -533,6 +601,12 @@ fileprivate struct FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer 
         return seq
     }
 }
+public func getRecentFiles() -> [SearchResult]  {
+    return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_get_recent_files($0
+    )
+})
+}
 public func searchFiles(query: String) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_search_files(
@@ -555,6 +629,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_rust_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_search_files() != 43504) {
         return InitializationResult.apiChecksumMismatch

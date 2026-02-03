@@ -243,6 +243,12 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
+RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustCallStatus *_Nonnull out_status
@@ -506,6 +512,12 @@ void ffi_rust_core_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_RUST_CORE_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_RUST_CORE_RUST_FUTURE_COMPLETE_VOID
 void ffi_rust_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
+uint16_t uniffi_rust_core_checksum_func_get_recent_files(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES

@@ -15,11 +15,16 @@ struct WindowAccessor: NSViewRepresentable {
                 window.titleVisibility = .hidden
                 window.titlebarAppearsTransparent = true
                 window.styleMask.insert(.fullSizeContentView)
+                window.styleMask.remove(.titled) // ADD THIS LINE - removes title bar entirely
+                
+                // Hide buttons (Red/Yellow/Green)
                 window.standardWindowButton(.closeButton)?.isHidden = true
                 window.standardWindowButton(.miniaturizeButton)?.isHidden = true
                 window.standardWindowButton(.zoomButton)?.isHidden = true
+                
                 window.isOpaque = false
                 window.backgroundColor = .clear
+                window.isMovableByWindowBackground = true
             }
         }
         return view
