@@ -5,24 +5,78 @@
 //  Created by Rohan Potta on 1/10/26.
 //
 
-//
-//  ContentView.swift
-//  WarpApp
-//
-//  Created by Rohan Potta on 1/10/26.
-//
-
 import SwiftUI
+
+// Sidebar item model
+enum SidebarItem: String, CaseIterable, Identifiable {
+    case recents = "Recents"
+    case applications = "Applications"
+    case desktop = "Desktop"
+    case documents = "Documents"
+    case downloads = "Downloads"
+    case home = "Home"
+    
+    var id: String { rawValue }
+    
+    var icon: String {
+        switch self {
+        case .recents: return "clock.fill"
+        case .applications: return "square.grid.2x2.fill"
+        case .desktop: return "desktopcomputer"
+        case .documents: return "doc.fill"
+        case .downloads: return "arrow.down.circle.fill"
+        case .home: return "house.fill"
+        }
+    }
+    
+    var path: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        switch self {
+        case .recents: return "" // Special case
+        case .applications: return "/Applications"
+        case .desktop: return "\(home)/Desktop"
+        case .documents: return "\(home)/Documents"
+        case .downloads: return "\(home)/Downloads"
+        case .home: return home
+        }
+    }
+}
 
 struct ContentView: View {
     @State private var query = ""
     @State private var results: [SearchResult] = []
     @State private var searchTask: Task<Void, Never>? = nil
-    @State private var selectedId: String? = nil
+    @State private var selectedFileId: String? = nil
+    @State private var selectedSidebarItem: SidebarItem = .recents
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            // --- SIDEBAR ---
+            List(selection: $selectedSidebarItem) {
+                Section("Favorites") {
+                    ForEach([SidebarItem.recents, .desktop, .documents, .downloads], id: \.self) { item in
+                        Label(item.rawValue, systemImage: item.icon)
+                            .tag(item)
+                    }
+                }
+                
+                Section("Locations") {
+                    ForEach([SidebarItem.applications, .home], id: \.self) { item in
+                        Label(item.rawValue, systemImage: item.icon)
+                            .tag(item)
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            .frame(minWidth: 180)
+            .onChange(of: selectedSidebarItem) { newItem in
+                loadFolder(newItem)
+            }
+        } detail: {
+            // --- MAIN CONTENT AREA ---
             VStack(spacing: 0) {
-                // --- SEARCH BAR ---
+                // Search Bar
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundColor(.gray)
@@ -31,30 +85,28 @@ struct ContentView: View {
                     TextField("Search...", text: $query)
                         .textFieldStyle(.plain)
                         .font(.title2)
-                        .padding(.vertical, 16) // Slightly taller for better look
+                        .padding(.vertical, 12)
                         .onSubmit { openSelected() }
                         .onChange(of: query) { newValue in
                             runSearch(for: newValue)
                         }
                 }
                 .padding(.horizontal)
-                // Fix: Ensure this background covers the very top edge
-                .background(Color.black.opacity(0.5))
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
                 
-                Divider().background(Color.gray.opacity(0.3))
+                Divider()
 
-                // --- RESULTS LIST ---
+                // Results List
                 ScrollView {
-                     // ... (Keep your existing List code here) ...
-                     LazyVStack(spacing: 0) {
+                    LazyVStack(spacing: 0) {
                         ForEach(results, id: \.filePath) { file in
                             FileRowView(
                                 file: file,
-                                isSelected: selectedId == file.filePath
+                                isSelected: selectedFileId == file.filePath
                             )
                             .contentShape(Rectangle())
                             .onHover { isHovering in
-                                if isHovering { selectedId = file.filePath }
+                                if isHovering { selectedFileId = file.filePath }
                             }
                             .onTapGesture {
                                 openFile(file.filePath)
@@ -64,28 +116,36 @@ struct ContentView: View {
                     .padding(8)
                 }
             }
-            .frame(minWidth: 600, minHeight: 400)
-            .background(
-                ZStack {
-                    WindowAccessor()
-                    VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
-                    Color.black.opacity(0.85)
-                }
-            )
-            // FIX: Remove the manual clipShape if it's cutting off the top
-            .cornerRadius(16)
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-            )
-            // FIX: This ensures the custom background goes BEHIND the invisible title bar area
-            .edgesIgnoringSafeArea(.all)
-            .task { loadRecents() }
+            .frame(minWidth: 400)
         }
+        .frame(minWidth: 700, minHeight: 500)
+        .task { loadFolder(.recents) }
+    }
     
     // --- ACTIONS ---
     
-    // Function to fetch recent files
+    func loadFolder(_ item: SidebarItem) {
+        query = "" // Clear search when switching folders
+        
+        if item == .recents {
+            loadRecents()
+            return
+        }
+        
+        // Load directory contents
+        Task {
+            let folderPath = item.path
+            let contents = await Task.detached(priority: .userInitiated) {
+                return loadDirectoryContents(path: folderPath)
+            }.value
+            
+            await MainActor.run {
+                self.results = contents
+                self.selectedFileId = contents.first?.filePath
+            }
+        }
+    }
+    
     func loadRecents() {
         Task {
             let recentFiles = await Task.detached(priority: .userInitiated) {
@@ -93,26 +153,67 @@ struct ContentView: View {
             }.value
             
             await MainActor.run {
-                // Only populate if the user hasn't started typing yet
                 if self.query.isEmpty {
                     self.results = recentFiles
-                    self.selectedId = recentFiles.first?.filePath
+                    self.selectedFileId = recentFiles.first?.filePath
                 }
             }
         }
+    }
+    
+    func loadDirectoryContents(path: String) -> [SearchResult] {
+        var items: [(result: SearchResult, modDate: Date)] = []
+        let fileManager = FileManager.default
+        
+        do {
+            let contents = try fileManager.contentsOfDirectory(atPath: path)
+            for name in contents {
+                // Skip hidden files
+                if name.hasPrefix(".") { continue }
+                
+                let fullPath = (path as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                
+                if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir) {
+                    let attrs = try? fileManager.attributesOfItem(atPath: fullPath)
+                    let size = (attrs?[.size] as? UInt64) ?? 0
+                    let modDate = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
+                    
+                    // Use modification timestamp as score for sorting
+                    let score = Int64(modDate.timeIntervalSince1970)
+                    
+                    items.append((
+                        result: SearchResult(
+                            fileName: name,
+                            filePath: fullPath,
+                            fileSize: size,
+                            isFolder: isDir.boolValue,
+                            score: score
+                        ),
+                        modDate: modDate
+                    ))
+                }
+            }
+        } catch {
+            print("Error loading directory: \(error)")
+        }
+        
+        // Sort by modification date (most recent first)
+        items.sort { $0.modDate > $1.modDate }
+        
+        return items.map { $0.result }
     }
 
     func runSearch(for text: String) {
         searchTask?.cancel()
         
-        // If query is cleared, go back to showing Recents
         if text.isEmpty {
-            loadRecents()
+            loadFolder(selectedSidebarItem)
             return
         }
         
         searchTask = Task {
-            try? await Task.sleep(nanoseconds: 100_000_000) // Debounce
+            try? await Task.sleep(nanoseconds: 100_000_000)
             if Task.isCancelled { return }
             
             let newResults = await Task.detached(priority: .userInitiated) {
@@ -121,14 +222,14 @@ struct ContentView: View {
             
             await MainActor.run {
                 self.results = newResults
-                self.selectedId = newResults.first?.filePath
+                self.selectedFileId = newResults.first?.filePath
             }
         }
     }
     
     func openSelected() {
-        if let selectedId = selectedId,
-           let file = results.first(where: { $0.filePath == selectedId }) {
+        if let selectedFileId = selectedFileId,
+           let file = results.first(where: { $0.filePath == selectedFileId }) {
             openFile(file.filePath)
         } else if let first = results.first {
             openFile(first.filePath)
@@ -149,44 +250,33 @@ struct FileRowView: View {
 
     var body: some View {
         HStack {
-            // Icon
-            Image(systemName: file.isFolder ? "folder.fill" : "doc.fill")
-                .foregroundColor(file.isFolder ? .blue : .gray)
-                .font(.title3)
-                .frame(width: 30)
+            // Real macOS system icon for the file
+            Image(nsImage: NSWorkspace.shared.icon(forFile: file.filePath))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 32, height: 32)
 
-            VStack(alignment: .leading) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(file.fileName)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.white)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.primary)
                 
-                HStack(spacing: 6) {
-                    // Size Text
-                    Text(formattedSize)
-                        .font(.system(size: 10))
-                        .foregroundColor(.gray.opacity(0.8))
-                    
-                    Text("•")
-                        .foregroundColor(.gray.opacity(0.5))
-                        .font(.system(size: 8))
-
-                    Text(file.filePath)
-                        .font(.system(size: 11))
-                        .foregroundColor(.gray)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                Text(formattedSize)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
             }
             Spacer()
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 12)
-        .background(isSelected ? Color.blue.opacity(0.4) : Color.clear)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
         .cornerRadius(6)
     }
     
-    // Helper property for formatted size
     private var formattedSize: String {
+        if file.isFolder {
+            return "Folder"
+        }
         let sizeKB = Double(file.fileSize) / 1024.0
         if sizeKB > 1024 {
             return String(format: "%.1f MB", sizeKB / 1024.0)
@@ -207,7 +297,6 @@ struct VisualEffectView: NSViewRepresentable {
         view.material = material
         view.blendingMode = blendingMode
         view.state = .active
-        view.appearance = NSAppearance(named: .vibrantDark)
         return view
     }
 
