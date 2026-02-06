@@ -14,6 +14,75 @@ pub struct SearchResult {
     pub file_size: u64,
     pub is_folder: bool,
     pub score: i64,
+    pub date_value: i64,      // Unix timestamp of most relevant date
+    pub date_kind: String,    // "Modified", "Created", or "Accessed"
+    pub file_kind: String,    // "PDF Document", "Folder", etc.
+}
+
+// Helper to get file kind from extension
+fn get_file_kind(path: &std::path::Path, is_folder: bool) -> String {
+    if is_folder {
+        return "Folder".to_string();
+    }
+    
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("pdf") => "PDF Document",
+        Some("doc") | Some("docx") => "Word Document",
+        Some("xls") | Some("xlsx") => "Excel Spreadsheet",
+        Some("ppt") | Some("pptx") => "Presentation",
+        Some("txt") => "Plain Text",
+        Some("md") => "Markdown",
+        Some("html") | Some("htm") => "HTML Document",
+        Some("css") => "CSS Stylesheet",
+        Some("js") => "JavaScript",
+        Some("ts") => "TypeScript",
+        Some("json") => "JSON",
+        Some("py") => "Python Script",
+        Some("rs") => "Rust Source",
+        Some("swift") => "Swift Source",
+        Some("java") => "Java Source",
+        Some("go") => "Go Source",
+        Some("c") | Some("h") => "C Source",
+        Some("cpp") | Some("hpp") => "C++ Source",
+        Some("jpg") | Some("jpeg") => "JPEG Image",
+        Some("png") => "PNG Image",
+        Some("gif") => "GIF Image",
+        Some("heic") => "HEIC Image",
+        Some("svg") => "SVG Image",
+        Some("mp4") => "MP4 Video",
+        Some("mov") => "QuickTime Movie",
+        Some("mp3") => "MP3 Audio",
+        Some("wav") => "WAV Audio",
+        Some("zip") => "ZIP Archive",
+        Some("dmg") => "Disk Image",
+        Some("app") => "Application",
+        Some(ext) => return format!("{} File", ext.to_uppercase()),
+        None => "Document",
+    }.to_string()
+}
+
+// Helper to get the most relevant date from metadata
+// NOTE: We intentionally ignore atime (access time) because macOS updates it
+// constantly for Spotlight indexing, Quick Look, etc., making old files appear recent
+fn get_best_date(metadata: &std::fs::Metadata) -> (i64, &'static str) {
+    let mtime = metadata.modified().ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    
+    let ctime = metadata.created().ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    
+    // Return the most recent of created or modified
+    // ctime = when file was created/downloaded to this Mac
+    // mtime = when file contents were last modified
+    if ctime > mtime {
+        (ctime, "Created")
+    } else {
+        (mtime, "Modified")
+    }
 }
 
 #[uniffi::export]
@@ -47,17 +116,29 @@ pub fn search_files(query: String) -> Vec<SearchResult> {
                 
                 if let Some(score) = matcher.fuzzy_match(&file_name, &query) {
                     let is_folder = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    let path = entry.path().to_string_lossy().to_string();
+                    let path = entry.path();
+                    let path_str = path.to_string_lossy().to_string();
+                    
+                    let (size, date_value, date_kind) = if let Ok(metadata) = entry.metadata() {
+                        let (dv, dk) = get_best_date(&metadata);
+                        (metadata.len(), dv, dk)
+                    } else {
+                        (0, 0, "Unknown")
+                    };
+                    
+                    let file_kind = get_file_kind(path, is_folder);
 
                     if let Ok(mut lock) = results.lock() {
                         if lock.len() < 2000 {
                             lock.push(SearchResult {
                                 file_name: file_name.to_string(),
-                                file_path: path,
+                                file_path: path_str,
                                 file_size: size,
-                                is_folder: is_folder,
-                                score: score,
+                                is_folder,
+                                score,
+                                date_value,
+                                date_kind: date_kind.to_string(),
+                                file_kind,
                             });
                         } else {
                             return ignore::WalkState::Quit;
@@ -80,30 +161,20 @@ pub fn search_files(query: String) -> Vec<SearchResult> {
 pub fn get_recent_files() -> Vec<SearchResult> {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
     
-    // Only scan folders where real user files live
     let user_folders = vec![
         format!("{}/Documents", home),
         format!("{}/Downloads", home),
         format!("{}/Desktop", home),
     ];
     
-    // File extensions that represent real user files
     let allowed_extensions: std::collections::HashSet<&str> = [
-        // Documents
         "pdf", "doc", "docx", "txt", "rtf", "md", "pages", "odt",
-        // Spreadsheets
         "xls", "xlsx", "csv", "numbers",
-        // Presentations
         "ppt", "pptx", "key",
-        // Images
         "jpg", "jpeg", "png", "gif", "heic", "webp", "svg", "psd", "ai",
-        // Videos
         "mp4", "mov", "avi", "mkv", "webm",
-        // Audio
         "mp3", "wav", "aac", "flac", "m4a",
-        // Code
         "py", "js", "ts", "rs", "swift", "java", "go", "html", "css", "json",
-        // Archives
         "zip", "tar", "gz", "rar", "7z", "dmg",
     ].iter().cloned().collect();
 
@@ -132,7 +203,6 @@ pub fn get_recent_files() -> Vec<SearchResult> {
                 if let Ok(entry) = entry_result {
                     let path = entry.path();
                     
-                    // Only include files with allowed extensions
                     if let Some(ext) = path.extension() {
                         let ext_lower = ext.to_string_lossy().to_lowercase();
                         if !allowed_ext.contains(ext_lower.as_str()) {
@@ -144,29 +214,31 @@ pub fn get_recent_files() -> Vec<SearchResult> {
 
                     if let Ok(metadata) = entry.metadata() {
                         if metadata.is_file() {
-                            if let Ok(modified) = metadata.modified() {
-                                if let Ok(duration) = SystemTime::now().duration_since(modified) {
-                                    // Last 7 days
-                                    if duration.as_secs() < 60 * 60 * 24 * 7 {
-                                        let name = entry.file_name().to_string_lossy().to_string();
-                                        let path_str = path.to_string_lossy().to_string();
-                                        
-                                        let score = modified
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs() as i64;
+                            let (date_value, date_kind) = get_best_date(&metadata);
+                            
+                            // Only files active in last 7 days
+                            let now = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            
+                            if now - date_value < 60 * 60 * 24 * 7 {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                let path_str = path.to_string_lossy().to_string();
+                                let file_kind = get_file_kind(path, false);
 
-                                        if let Ok(mut lock) = results.lock() {
-                                            if lock.len() < 100 {
-                                                lock.push(SearchResult {
-                                                    file_name: name,
-                                                    file_path: path_str,
-                                                    file_size: metadata.len(),
-                                                    is_folder: false,
-                                                    score: score,
-                                                });
-                                            }
-                                        }
+                                if let Ok(mut lock) = results.lock() {
+                                    if lock.len() < 100 {
+                                        lock.push(SearchResult {
+                                            file_name: name,
+                                            file_path: path_str,
+                                            file_size: metadata.len(),
+                                            is_folder: false,
+                                            score: date_value, // Use date as score for sorting
+                                            date_value,
+                                            date_kind: date_kind.to_string(),
+                                            file_kind,
+                                        });
                                     }
                                 }
                             }
@@ -179,8 +251,8 @@ pub fn get_recent_files() -> Vec<SearchResult> {
     }
 
     let mut final_results = results_mutex.lock().unwrap().clone();
-    final_results.sort_by(|a, b| b.score.cmp(&a.score));
-    final_results.truncate(20);
+    final_results.sort_by(|a, b| b.date_value.cmp(&a.date_value));
+    final_results.truncate(30);
 
     final_results
 }
