@@ -419,6 +419,22 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -514,6 +530,65 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+/**
+ * Result type for file operations
+ */
+public struct FileOpResult: Equatable, Hashable {
+    public var success: Bool
+    public var message: String
+    public var affectedCount: Int32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(success: Bool, message: String, affectedCount: Int32) {
+        self.success = success
+        self.message = message
+        self.affectedCount = affectedCount
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension FileOpResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileOpResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileOpResult {
+        return
+            try FileOpResult(
+                success: FfiConverterBool.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                affectedCount: FfiConverterInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FileOpResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.success, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterInt32.write(value.affectedCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileOpResult_lift(_ buf: RustBuffer) throws -> FileOpResult {
+    return try FfiConverterTypeFileOpResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileOpResult_lower(_ value: FileOpResult) -> RustBuffer {
+    return FfiConverterTypeFileOpResult.lower(value)
+}
+
+
 public struct SearchResult: Equatable, Hashable {
     public var fileName: String
     public var filePath: String
@@ -592,6 +667,31 @@ public func FfiConverterTypeSearchResult_lower(_ value: SearchResult) -> RustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer {
     typealias SwiftType = [SearchResult]
 
@@ -613,9 +713,81 @@ fileprivate struct FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer 
         return seq
     }
 }
+/**
+ * Compress files into a ZIP archive
+ */
+public func compressFiles(paths: [String], archivePath: String) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_compress_files(
+        FfiConverterSequenceString.lower(paths),
+        FfiConverterString.lower(archivePath),$0
+    )
+})
+}
+/**
+ * Copy files to a destination folder
+ */
+public func copyFiles(sourcePaths: [String], destination: String) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_copy_files(
+        FfiConverterSequenceString.lower(sourcePaths),
+        FfiConverterString.lower(destination),$0
+    )
+})
+}
+/**
+ * Create a new folder
+ */
+public func createFolder(path: String) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_create_folder(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
 public func getRecentFiles() -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_get_recent_files($0
+    )
+})
+}
+/**
+ * Load cached index for instant startup
+ */
+public func loadCachedIndex() -> [SearchResult]  {
+    return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_load_cached_index($0
+    )
+})
+}
+/**
+ * Move files to a destination folder
+ */
+public func moveFiles(sourcePaths: [String], destination: String) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_move_files(
+        FfiConverterSequenceString.lower(sourcePaths),
+        FfiConverterString.lower(destination),$0
+    )
+})
+}
+/**
+ * Rebuild the index and save to cache (call in background)
+ */
+public func rebuildIndex() -> [SearchResult]  {
+    return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_rebuild_index($0
+    )
+})
+}
+/**
+ * Rename a file
+ */
+public func renameFile(path: String, newName: String) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_rename_file(
+        FfiConverterString.lower(path),
+        FfiConverterString.lower(newName),$0
     )
 })
 }
@@ -623,6 +795,16 @@ public func searchFiles(query: String) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_search_files(
         FfiConverterString.lower(query),$0
+    )
+})
+}
+/**
+ * Move files to Trash
+ */
+public func trashFiles(paths: [String]) -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_trash_files(
+        FfiConverterSequenceString.lower(paths),$0
     )
 })
 }
@@ -642,10 +824,34 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_rust_core_checksum_func_compress_files() != 27291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_copy_files() != 52022) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_create_folder() != 32855) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rust_core_checksum_func_load_cached_index() != 33893) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_move_files() != 44044) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_rebuild_index() != 17457) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_rename_file() != 59089) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_search_files() != 43504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_trash_files() != 51150) {
         return InitializationResult.apiChecksumMismatch
     }
 

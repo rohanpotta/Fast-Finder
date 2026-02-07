@@ -317,3 +317,249 @@ pub fn get_recent_files() -> Vec<SearchResult> {
     
     recent
 }
+
+// ============== FILE OPERATIONS ==============
+
+/// Result type for file operations
+#[derive(uniffi::Record, Clone)]
+pub struct FileOpResult {
+    pub success: bool,
+    pub message: String,
+    pub affected_count: i32,
+}
+
+/// Move files to a destination folder
+#[uniffi::export]
+pub fn move_files(source_paths: Vec<String>, destination: String) -> FileOpResult {
+    let dest_path = std::path::Path::new(&destination);
+    
+    // Create destination if it doesn't exist
+    if !dest_path.exists() {
+        if let Err(e) = fs::create_dir_all(dest_path) {
+            return FileOpResult {
+                success: false,
+                message: format!("Failed to create destination: {}", e),
+                affected_count: 0,
+            };
+        }
+    }
+    
+    let mut moved = 0;
+    let mut errors = Vec::new();
+    
+    for src in &source_paths {
+        let src_path = std::path::Path::new(src);
+        if let Some(file_name) = src_path.file_name() {
+            let dest_file = dest_path.join(file_name);
+            match fs::rename(src_path, &dest_file) {
+                Ok(_) => moved += 1,
+                Err(_e) => {
+                    // If rename fails (cross-device), try copy + delete
+                    if let Err(copy_err) = fs::copy(src_path, &dest_file) {
+                        errors.push(format!("{}: {}", src, copy_err));
+                    } else {
+                        let _ = fs::remove_file(src_path);
+                        moved += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    FileOpResult {
+        success: errors.is_empty(),
+        message: if errors.is_empty() {
+            format!("Moved {} files", moved)
+        } else {
+            format!("Moved {} files, {} errors: {}", moved, errors.len(), errors.join("; "))
+        },
+        affected_count: moved,
+    }
+}
+
+/// Copy files to a destination folder
+#[uniffi::export]
+pub fn copy_files(source_paths: Vec<String>, destination: String) -> FileOpResult {
+    let dest_path = std::path::Path::new(&destination);
+    
+    if !dest_path.exists() {
+        if let Err(e) = fs::create_dir_all(dest_path) {
+            return FileOpResult {
+                success: false,
+                message: format!("Failed to create destination: {}", e),
+                affected_count: 0,
+            };
+        }
+    }
+    
+    let mut copied = 0;
+    let mut errors = Vec::new();
+    
+    for src in &source_paths {
+        let src_path = std::path::Path::new(src);
+        if let Some(file_name) = src_path.file_name() {
+            let dest_file = dest_path.join(file_name);
+            match fs::copy(src_path, &dest_file) {
+                Ok(_) => copied += 1,
+                Err(e) => errors.push(format!("{}: {}", src, e)),
+            }
+        }
+    }
+    
+    FileOpResult {
+        success: errors.is_empty(),
+        message: if errors.is_empty() {
+            format!("Copied {} files", copied)
+        } else {
+            format!("Copied {} files, {} errors", copied, errors.len())
+        },
+        affected_count: copied,
+    }
+}
+
+/// Move files to Trash
+#[uniffi::export]
+pub fn trash_files(paths: Vec<String>) -> FileOpResult {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let trash_path = std::path::Path::new(&home).join(".Trash");
+    
+    let mut trashed = 0;
+    let mut errors = Vec::new();
+    
+    for src in &paths {
+        let src_path = std::path::Path::new(src);
+        if let Some(file_name) = src_path.file_name() {
+            // Generate unique name if file already exists in trash
+            let mut dest_file = trash_path.join(file_name);
+            let mut counter = 1;
+            while dest_file.exists() {
+                let stem = src_path.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = src_path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                dest_file = trash_path.join(format!("{} {}{}", stem, counter, ext));
+                counter += 1;
+            }
+            
+            match fs::rename(src_path, &dest_file) {
+                Ok(_) => trashed += 1,
+                Err(e) => errors.push(format!("{}: {}", src, e)),
+            }
+        }
+    }
+    
+    FileOpResult {
+        success: errors.is_empty(),
+        message: if errors.is_empty() {
+            format!("Moved {} items to Trash", trashed)
+        } else {
+            format!("Trashed {} items, {} errors", trashed, errors.len())
+        },
+        affected_count: trashed,
+    }
+}
+
+/// Rename a file
+#[uniffi::export]
+pub fn rename_file(path: String, new_name: String) -> FileOpResult {
+    let src_path = std::path::Path::new(&path);
+    
+    if let Some(parent) = src_path.parent() {
+        let new_path = parent.join(&new_name);
+        
+        if new_path.exists() {
+            return FileOpResult {
+                success: false,
+                message: format!("File '{}' already exists", new_name),
+                affected_count: 0,
+            };
+        }
+        
+        match fs::rename(src_path, &new_path) {
+            Ok(_) => FileOpResult {
+                success: true,
+                message: format!("Renamed to '{}'", new_name),
+                affected_count: 1,
+            },
+            Err(e) => FileOpResult {
+                success: false,
+                message: format!("Rename failed: {}", e),
+                affected_count: 0,
+            },
+        }
+    } else {
+        FileOpResult {
+            success: false,
+            message: "Invalid path".to_string(),
+            affected_count: 0,
+        }
+    }
+}
+
+/// Create a new folder
+#[uniffi::export]
+pub fn create_folder(path: String) -> FileOpResult {
+    match fs::create_dir_all(&path) {
+        Ok(_) => FileOpResult {
+            success: true,
+            message: format!("Created folder"),
+            affected_count: 1,
+        },
+        Err(e) => FileOpResult {
+            success: false,
+            message: format!("Failed to create folder: {}", e),
+            affected_count: 0,
+        },
+    }
+}
+
+/// Compress files into a ZIP archive
+#[uniffi::export]
+pub fn compress_files(paths: Vec<String>, archive_path: String) -> FileOpResult {
+    use std::io::{Read, Write};
+    
+    let file = match fs::File::create(&archive_path) {
+        Ok(f) => f,
+        Err(e) => return FileOpResult {
+            success: false,
+            message: format!("Failed to create archive: {}", e),
+            affected_count: 0,
+        },
+    };
+    
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    
+    let mut added = 0;
+    
+    for src in &paths {
+        let src_path = std::path::Path::new(src);
+        if let Some(file_name) = src_path.file_name() {
+            if src_path.is_file() {
+                if let Ok(mut f) = fs::File::open(src_path) {
+                    let mut buffer = Vec::new();
+                    if f.read_to_end(&mut buffer).is_ok() {
+                        if zip.start_file(file_name.to_string_lossy(), options).is_ok() {
+                            if zip.write_all(&buffer).is_ok() {
+                                added += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if zip.finish().is_err() {
+        return FileOpResult {
+            success: false,
+            message: "Failed to finalize archive".to_string(),
+            affected_count: 0,
+        };
+    }
+    
+    FileOpResult {
+        success: true,
+        message: format!("Compressed {} files", added),
+        affected_count: added,
+    }
+}

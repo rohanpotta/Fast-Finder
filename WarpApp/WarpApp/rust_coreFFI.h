@@ -243,15 +243,57 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COMPRESS_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COMPRESS_FILES
+RustBuffer uniffi_rust_core_fn_func_compress_files(RustBuffer paths, RustBuffer archive_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COPY_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COPY_FILES
+RustBuffer uniffi_rust_core_fn_func_copy_files(RustBuffer source_paths, RustBuffer destination, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_CREATE_FOLDER
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_CREATE_FOLDER
+RustBuffer uniffi_rust_core_fn_func_create_folder(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustCallStatus *_Nonnull out_status
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
+RustBuffer uniffi_rust_core_fn_func_load_cached_index(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_MOVE_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_MOVE_FILES
+RustBuffer uniffi_rust_core_fn_func_move_files(RustBuffer source_paths, RustBuffer destination, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
+RustBuffer uniffi_rust_core_fn_func_rebuild_index(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RENAME_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RENAME_FILE
+RustBuffer uniffi_rust_core_fn_func_rename_file(RustBuffer path, RustBuffer new_name, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_TRASH_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_TRASH_FILES
+RustBuffer uniffi_rust_core_fn_func_trash_files(RustBuffer paths, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_RUST_CORE_RUSTBUFFER_ALLOC
@@ -514,15 +556,63 @@ void ffi_rust_core_rust_future_free_void(uint64_t handle
 void ffi_rust_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COMPRESS_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COMPRESS_FILES
+uint16_t uniffi_rust_core_checksum_func_compress_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COPY_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COPY_FILES
+uint16_t uniffi_rust_core_checksum_func_copy_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CREATE_FOLDER
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CREATE_FOLDER
+uint16_t uniffi_rust_core_checksum_func_create_folder(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
 uint16_t uniffi_rust_core_checksum_func_get_recent_files(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LOAD_CACHED_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LOAD_CACHED_INDEX
+uint16_t uniffi_rust_core_checksum_func_load_cached_index(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_MOVE_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_MOVE_FILES
+uint16_t uniffi_rust_core_checksum_func_move_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
+uint16_t uniffi_rust_core_checksum_func_rebuild_index(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RENAME_FILE
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RENAME_FILE
+uint16_t uniffi_rust_core_checksum_func_rename_file(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 uint16_t uniffi_rust_core_checksum_func_search_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_TRASH_FILES
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_TRASH_FILES
+uint16_t uniffi_rust_core_checksum_func_trash_files(void
     
 );
 #endif

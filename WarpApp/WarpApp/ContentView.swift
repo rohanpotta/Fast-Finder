@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Quartz // For Quick Look preview
 
 // Sidebar item model
 enum SidebarItem: String, CaseIterable, Identifiable {
@@ -62,10 +63,15 @@ struct ContentView: View {
     @State private var query = ""
     @State private var results: [SearchResult] = []
     @State private var searchTask: Task<Void, Never>? = nil
-    @State private var selectedFileId: String? = nil
+    @State private var selectedFileIds: Set<String> = []  // Multi-select
     @State private var selectedSidebarItem: SidebarItem = .recents
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sortOrder = [KeyPathComparator(\SearchResult.dateValue, order: .reverse)]
+    
+    // File operation state
+    @State private var showRenameSheet = false
+    @State private var renameText = ""
+    @State private var showMovePanel = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -114,7 +120,7 @@ struct ContentView: View {
                 Divider()
 
                 // --- TABLE VIEW ---
-                Table(sortedResults, selection: $selectedFileId, sortOrder: $sortOrder) {
+                Table(sortedResults, selection: $selectedFileIds, sortOrder: $sortOrder) {
                     TableColumn("Name") { file in
                         HStack {
                             Image(nsImage: NSWorkspace.shared.icon(forFile: file.filePath))
@@ -124,15 +130,17 @@ struct ContentView: View {
                             Text(file.fileName)
                                 .lineLimit(1)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading) // Fill entire cell width
-                        .contentShape(Rectangle()) // Make whitespace clickable
-                        .gesture(TapGesture(count: 2).onEnded {
-                            openFile(file.filePath)
-                        })
-                        .simultaneousGesture(TapGesture().onEnded {
-                            // Fires immediately on first click for instant highlight
-                            selectedFileId = file.filePath
-                        })
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if selectedFileIds.count == 1 && selectedFileIds.contains(file.filePath) {
+                                // Already selected → Open
+                                openFile(file.filePath)
+                            } else {
+                                // Select this file
+                                selectedFileIds = [file.filePath]
+                            }
+                        }
                     }
                     .width(min: 200, ideal: 300)
                     
@@ -154,20 +162,85 @@ struct ContentView: View {
                 }
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
                 .contextMenu {
+                    // Quick Look (single file only)
+                    if selectedFileIds.count == 1 {
+                        Button("Quick Look") {
+                            QuickLookController.shared.togglePreview(for: selectedFileIds.first)
+                        }
+                        .keyboardShortcut(.space, modifiers: [])
+                    }
+                    
+                    Divider()
+                    
                     Button("Open") {
-                        if let id = selectedFileId {
-                            openFile(id)
+                        for path in selectedFileIds {
+                            openFile(path)
                         }
                     }
+                    .keyboardShortcut(.return, modifiers: [])
+                    
+                    // Rename (single file only)
+                    if selectedFileIds.count == 1 {
+                        Button("Rename...") {
+                            if let path = selectedFileIds.first,
+                               let name = URL(fileURLWithPath: path).lastPathComponent.components(separatedBy: ".").first {
+                                renameText = URL(fileURLWithPath: path).lastPathComponent
+                                showRenameSheet = true
+                            }
+                        }
+                    }
+                    
+                    Divider()
+                    
+                    Button("Move to Trash") {
+                        let paths = Array(selectedFileIds)
+                        let result = trashFiles(paths: paths)
+                        if result.success {
+                            // Remove from results
+                            results.removeAll { selectedFileIds.contains($0.filePath) }
+                            selectedFileIds.removeAll()
+                        }
+                    }
+                    .keyboardShortcut(.delete, modifiers: .command)
+                    
+                    Button("Copy Path") {
+                        let paths = selectedFileIds.joined(separator: "\n")
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(paths, forType: .string)
+                    }
+                    .keyboardShortcut("c", modifiers: .command)
+                    
+                    // Compress (multiple files)
+                    if !selectedFileIds.isEmpty {
+                        Button("Compress \(selectedFileIds.count) item\(selectedFileIds.count > 1 ? "s" : "")...") {
+                            compressSelected()
+                        }
+                    }
+                    
+                    Divider()
+                    
                     Button("Show in Finder") {
-                        if let id = selectedFileId {
-                            NSWorkspace.shared.selectFile(id, inFileViewerRootedAtPath: "")
+                        if let path = selectedFileIds.first {
+                            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
                         }
                     }
                 }
                 .onKeyPress(.return) {
-                    if let id = selectedFileId {
-                        openFile(id)
+                    for path in selectedFileIds {
+                        openFile(path)
+                    }
+                    return .handled
+                }
+                .onKeyPress(.space) {
+                    QuickLookController.shared.togglePreview(for: selectedFileIds.first)
+                    return .handled
+                }
+                .onKeyPress(.delete) {
+                    let paths = Array(selectedFileIds)
+                    let result = trashFiles(paths: paths)
+                    if result.success {
+                        results.removeAll { selectedFileIds.contains($0.filePath) }
+                        selectedFileIds.removeAll()
                     }
                     return .handled
                 }
@@ -175,7 +248,23 @@ struct ContentView: View {
             .frame(minWidth: 500)
         }
         .frame(minWidth: 750, minHeight: 500)
+        .background(QuickLookHost())
         .task { loadFolder(.recents) }
+        .sheet(isPresented: $showRenameSheet) {
+            RenameSheet(
+                currentName: renameText,
+                onRename: { newName in
+                    if let path = selectedFileIds.first {
+                        let result = renameFile(path: path, newName: newName)
+                        if result.success {
+                            loadFolder(selectedSidebarItem)
+                        }
+                    }
+                    showRenameSheet = false
+                },
+                onCancel: { showRenameSheet = false }
+            )
+        }
     }
     
     // Sorted results based on current sort order
@@ -202,21 +291,45 @@ struct ContentView: View {
             
             await MainActor.run {
                 self.results = contents
-                self.selectedFileId = contents.first?.filePath
+                self.selectedFileIds = contents.first.map { [$0.filePath] } ?? []
             }
         }
     }
     
     func loadRecents() {
+        // INSTANT: Load cached data first for immediate display
         Task {
-            let recentFiles = await Task.detached(priority: .userInitiated) {
-                return getRecentFiles()
+            let cachedFiles = await Task.detached(priority: .userInitiated) {
+                return loadCachedIndex()
             }.value
             
             await MainActor.run {
-                if self.query.isEmpty {
-                    self.results = recentFiles
-                    self.selectedFileId = recentFiles.first?.filePath
+                if self.query.isEmpty && !cachedFiles.isEmpty {
+                    // Filter to last 7 days and show immediately
+                    let weekAgo = Date().timeIntervalSince1970 - (60 * 60 * 24 * 7)
+                    let recent = cachedFiles
+                        .filter { Double($0.dateValue) > weekAgo }
+                        .sorted { $0.dateValue > $1.dateValue }
+                        .prefix(50)
+                    self.results = Array(recent)
+                    self.selectedFileIds = self.results.first.map { [$0.filePath] } ?? []
+                }
+            }
+            
+            // BACKGROUND: Rebuild index for fresh data
+            let freshFiles = await Task.detached(priority: .background) {
+                return rebuildIndex()
+            }.value
+            
+            await MainActor.run {
+                if self.query.isEmpty && self.selectedSidebarItem == .recents {
+                    let weekAgo = Date().timeIntervalSince1970 - (60 * 60 * 24 * 7)
+                    let recent = freshFiles
+                        .filter { Double($0.dateValue) > weekAgo }
+                        .sorted { $0.dateValue > $1.dateValue }
+                        .prefix(50)
+                    self.results = Array(recent)
+                    self.selectedFileIds = self.results.first.map { [$0.filePath] } ?? []
                 }
             }
         }
@@ -327,14 +440,14 @@ struct ContentView: View {
             
             await MainActor.run {
                 self.results = newResults
-                self.selectedFileId = newResults.first?.filePath
+                self.selectedFileIds = newResults.first.map { [$0.filePath] } ?? []
             }
         }
     }
     
     func openSelected() {
-        if let selectedFileId = selectedFileId {
-            openFile(selectedFileId)
+        if let firstSelected = selectedFileIds.first {
+            openFile(firstSelected)
         } else if let first = results.first {
             openFile(first.filePath)
         }
@@ -350,6 +463,23 @@ struct ContentView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return formatter.localizedString(for: date, relativeTo: Date())
+    }
+    
+    func compressSelected() {
+        guard let firstPath = selectedFileIds.first else { return }
+        let parentDir = URL(fileURLWithPath: firstPath).deletingLastPathComponent().path
+        let archiveName = selectedFileIds.count == 1
+            ? URL(fileURLWithPath: firstPath).deletingPathExtension().lastPathComponent + ".zip"
+            : "Archive.zip"
+        let archivePath = (parentDir as NSString).appendingPathComponent(archiveName)
+        
+        let paths = Array(selectedFileIds)
+        let result = compressFiles(paths: paths, archivePath: archivePath)
+        
+        if result.success {
+            // Refresh to show the new archive
+            loadFolder(selectedSidebarItem)
+        }
     }
 }
 
@@ -370,5 +500,118 @@ struct VisualEffectView: NSViewRepresentable {
     func updateNSView(_ view: NSVisualEffectView, context: Context) {
         view.material = material
         view.blendingMode = blendingMode
+    }
+}
+
+// --- QUICK LOOK SUPPORT ---
+
+class QuickLookController: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    static let shared = QuickLookController()
+    
+    var previewURL: URL?
+    
+    func togglePreview(for path: String?) {
+        guard let path = path else { 
+            print("Quick Look: No file path provided")
+            return 
+        }
+        previewURL = URL(fileURLWithPath: path)
+        
+        guard let panel = QLPreviewPanel.shared() else { 
+            print("Quick Look: Could not get panel")
+            return 
+        }
+        
+        if panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            // Set data source BEFORE showing
+            panel.dataSource = self
+            panel.delegate = self
+            panel.reloadData()
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+    
+    // MARK: - QLPreviewPanelDataSource
+    
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        return previewURL != nil ? 1 : 0
+    }
+    
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        guard let url = previewURL else { return nil }
+        return PreviewItem(url: url)
+    }
+}
+
+// QLPreviewItem wrapper (must be NSObject subclass)
+class PreviewItem: NSObject, QLPreviewItem {
+    let url: URL
+    
+    init(url: URL) {
+        self.url = url
+        super.init()
+    }
+    
+    var previewItemURL: URL? { url }
+}
+
+// NSView that accepts Quick Look panel
+class QuickLookHostView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+    
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        return true
+    }
+    
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = QuickLookController.shared
+        panel.delegate = QuickLookController.shared
+    }
+    
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        // Clean up if needed
+    }
+}
+
+// SwiftUI wrapper for Quick Look host
+struct QuickLookHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> QuickLookHostView {
+        return QuickLookHostView()
+    }
+    
+    func updateNSView(_ nsView: QuickLookHostView, context: Context) {}
+}
+
+// Rename sheet view
+struct RenameSheet: View {
+    @State var currentName: String
+    let onRename: (String) -> Void
+    let onCancel: () -> Void
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Rename")
+                .font(.headline)
+            
+            TextField("Name", text: $currentName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 300)
+            
+            HStack {
+                Button("Cancel") {
+                    onCancel()
+                }
+                .keyboardShortcut(.escape)
+                
+                Button("Rename") {
+                    onRename(currentName)
+                }
+                .keyboardShortcut(.return)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
     }
 }
