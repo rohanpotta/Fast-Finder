@@ -81,6 +81,9 @@ struct ContentView: View {
                     ForEach([SidebarItem.recents, .desktop, .documents, .downloads], id: \.self) { item in
                         Label(item.displayName, systemImage: item.icon)
                             .tag(item)
+                            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                                handleDrop(providers: providers, to: item)
+                            }
                     }
                 }
                 
@@ -88,6 +91,9 @@ struct ContentView: View {
                     ForEach([SidebarItem.user, .applications, .trash], id: \.self) { item in
                         Label(item.displayName, systemImage: item.icon)
                             .tag(item)
+                            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                                handleDrop(providers: providers, to: item)
+                            }
                     }
                 }
             }
@@ -119,48 +125,15 @@ struct ContentView: View {
                 
                 Divider()
 
-                // --- TABLE VIEW ---
-                Table(sortedResults, selection: $selectedFileIds, sortOrder: $sortOrder) {
-                    TableColumn("Name") { file in
-                        HStack {
-                            Image(nsImage: NSWorkspace.shared.icon(forFile: file.filePath))
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 20, height: 20)
-                            Text(file.fileName)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            if selectedFileIds.count == 1 && selectedFileIds.contains(file.filePath) {
-                                // Already selected → Open
-                                openFile(file.filePath)
-                            } else {
-                                // Select this file
-                                selectedFileIds = [file.filePath]
-                            }
-                        }
-                    }
-                    .width(min: 200, ideal: 300)
-                    
-                    TableColumn("Kind", value: \.fileKind) { file in
-                        Text(file.fileKind)
-                            .foregroundColor(.secondary)
-                    }
-                    .width(min: 100, ideal: 140)
-                    
-                    TableColumn("Date", value: \.dateValue) { file in
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(formattedDate(file.dateValue))
-                            Text(file.dateKind)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .width(min: 100, ideal: 120)
-                }
-                .tableStyle(.inset(alternatesRowBackgrounds: true))
+                // --- TABLE VIEW (NSTableView for double-click support) ---
+                FileTableView(
+                    files: sortedResults,
+                    selection: $selectedFileIds,
+                    onDoubleClick: { path in
+                        openFile(path)
+                    },
+                    onContextMenu: { _ in }
+                )
                 .contextMenu {
                     // Quick Look (single file only)
                     if selectedFileIds.count == 1 {
@@ -196,7 +169,6 @@ struct ContentView: View {
                         let paths = Array(selectedFileIds)
                         let result = trashFiles(paths: paths)
                         if result.success {
-                            // Remove from results
                             results.removeAll { selectedFileIds.contains($0.filePath) }
                             selectedFileIds.removeAll()
                         }
@@ -210,7 +182,6 @@ struct ContentView: View {
                     }
                     .keyboardShortcut("c", modifiers: .command)
                     
-                    // Compress (multiple files)
                     if !selectedFileIds.isEmpty {
                         Button("Compress \(selectedFileIds.count) item\(selectedFileIds.count > 1 ? "s" : "")...") {
                             compressSelected()
@@ -481,6 +452,51 @@ struct ContentView: View {
             loadFolder(selectedSidebarItem)
         }
     }
+    
+    // Handle dropping files onto sidebar items
+    func handleDrop(providers: [NSItemProvider], to item: SidebarItem) -> Bool {
+        // Can't drop onto Recents
+        guard item != .recents else { return false }
+        
+        var droppedPaths: [String] = []
+        let group = DispatchGroup()
+        
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier("public.file-url") {
+                group.enter()
+                provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+                    defer { group.leave() }
+                    if let data = data as? Data,
+                       let url = URL(dataRepresentation: data, relativeTo: nil) {
+                        droppedPaths.append(url.path)
+                    }
+                }
+            }
+        }
+        
+        group.notify(queue: .main) {
+            guard !droppedPaths.isEmpty else { return }
+            
+            if item == .trash {
+                // Move to trash
+                let result = trashFiles(paths: droppedPaths)
+                if result.success {
+                    self.results.removeAll { droppedPaths.contains($0.filePath) }
+                    self.selectedFileIds.removeAll()
+                }
+            } else {
+                // Move to folder
+                let destination = item.path
+                let result = moveFiles(sourcePaths: droppedPaths, destination: destination)
+                if result.success {
+                    self.results.removeAll { droppedPaths.contains($0.filePath) }
+                    self.selectedFileIds.removeAll()
+                }
+            }
+        }
+        
+        return true
+    }
 }
 
 // --- HELPERS ---
@@ -613,5 +629,214 @@ struct RenameSheet: View {
             }
         }
         .padding(24)
+    }
+}
+
+// MARK: - NSTableView Wrapper for Double-Click Support
+
+struct FileTableView: NSViewRepresentable {
+    let files: [SearchResult]
+    @Binding var selection: Set<String>
+    let onDoubleClick: (String) -> Void
+    let onContextMenu: (Set<String>) -> Void
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        let tableView = NSTableView()
+        
+        // Configure scroll view
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        
+        // Configure table view
+        tableView.style = .inset
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.allowsMultipleSelection = true
+        tableView.allowsColumnReordering = false
+        tableView.rowHeight = 24
+        
+        // Create columns
+        let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        nameColumn.title = "Name"
+        nameColumn.width = 300
+        nameColumn.minWidth = 200
+        tableView.addTableColumn(nameColumn)
+        
+        let kindColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("kind"))
+        kindColumn.title = "Kind"
+        kindColumn.width = 120
+        kindColumn.minWidth = 80
+        tableView.addTableColumn(kindColumn)
+        
+        let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
+        dateColumn.title = "Date"
+        dateColumn.width = 120
+        dateColumn.minWidth = 80
+        tableView.addTableColumn(dateColumn)
+        
+        // Set up delegate and data source
+        tableView.delegate = context.coordinator
+        tableView.dataSource = context.coordinator
+        
+        // CRITICAL: Set double-click action
+        tableView.target = context.coordinator
+        tableView.doubleAction = #selector(Coordinator.tableViewDoubleClick(_:))
+        
+        // Enable drag and drop
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        tableView.registerForDraggedTypes([.fileURL])
+        
+        context.coordinator.tableView = tableView
+        
+        return scrollView
+    }
+    
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let tableView = scrollView.documentView as? NSTableView else { return }
+        
+        let filesChanged = context.coordinator.files.count != files.count ||
+            !zip(context.coordinator.files, files).allSatisfy { $0.filePath == $1.filePath }
+        
+        context.coordinator.files = files
+        context.coordinator.selection = selection
+        context.coordinator.onDoubleClick = onDoubleClick
+        
+        // Only reload if files actually changed (not on selection change)
+        if filesChanged {
+            tableView.reloadData()
+        }
+        
+        // Sync selection from SwiftUI to NSTableView (without triggering delegate)
+        let currentSelection = tableView.selectedRowIndexes
+        var newIndexes = IndexSet()
+        for (index, file) in files.enumerated() {
+            if selection.contains(file.filePath) {
+                newIndexes.insert(index)
+            }
+        }
+        
+        if currentSelection != newIndexes {
+            tableView.selectRowIndexes(newIndexes, byExtendingSelection: false)
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(files: files, selection: selection, onDoubleClick: onDoubleClick, onSelectionChange: { newSelection in
+            DispatchQueue.main.async {
+                self.selection = newSelection
+            }
+        })
+    }
+    
+    class Coordinator: NSObject, NSTableViewDelegate, NSTableViewDataSource {
+        var files: [SearchResult]
+        var selection: Set<String>
+        var onDoubleClick: (String) -> Void
+        var onSelectionChange: (Set<String>) -> Void
+        weak var tableView: NSTableView?
+        
+        init(files: [SearchResult], selection: Set<String>, onDoubleClick: @escaping (String) -> Void, onSelectionChange: @escaping (Set<String>) -> Void) {
+            self.files = files
+            self.selection = selection
+            self.onDoubleClick = onDoubleClick
+            self.onSelectionChange = onSelectionChange
+        }
+        
+        func numberOfRows(in tableView: NSTableView) -> Int {
+            return files.count
+        }
+        
+        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+            guard row < files.count else { return nil }
+            let file = files[row]
+            
+            let cellView = NSTableCellView()
+            
+            if tableColumn?.identifier.rawValue == "name" {
+                let stackView = NSStackView()
+                stackView.orientation = .horizontal
+                stackView.spacing = 6
+                
+                // Icon
+                let icon = NSWorkspace.shared.icon(forFile: file.filePath)
+                icon.size = NSSize(width: 16, height: 16)
+                let imageView = NSImageView(image: icon)
+                imageView.imageScaling = .scaleProportionallyUpOrDown
+                imageView.setContentHuggingPriority(.required, for: .horizontal)
+                
+                // Text
+                let textField = NSTextField(labelWithString: file.fileName)
+                textField.lineBreakMode = .byTruncatingTail
+                
+                stackView.addArrangedSubview(imageView)
+                stackView.addArrangedSubview(textField)
+                
+                cellView.addSubview(stackView)
+                stackView.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    stackView.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
+                    stackView.trailingAnchor.constraint(equalTo: cellView.trailingAnchor, constant: -4),
+                    stackView.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
+                ])
+            } else if tableColumn?.identifier.rawValue == "kind" {
+                let textField = NSTextField(labelWithString: file.fileKind)
+                textField.textColor = .secondaryLabelColor
+                cellView.addSubview(textField)
+                textField.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    textField.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
+                    textField.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
+                ])
+            } else if tableColumn?.identifier.rawValue == "date" {
+                let date = Date(timeIntervalSince1970: TimeInterval(file.dateValue))
+                let formatter = RelativeDateTimeFormatter()
+                formatter.unitsStyle = .abbreviated
+                let dateStr = formatter.localizedString(for: date, relativeTo: Date())
+                
+                let textField = NSTextField(labelWithString: dateStr)
+                textField.textColor = .secondaryLabelColor
+                cellView.addSubview(textField)
+                textField.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    textField.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
+                    textField.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
+                ])
+            }
+            
+            return cellView
+        }
+        
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard let tableView = notification.object as? NSTableView else { return }
+            var newSelection = Set<String>()
+            for index in tableView.selectedRowIndexes {
+                if index < files.count {
+                    newSelection.insert(files[index].filePath)
+                }
+            }
+            onSelectionChange(newSelection)
+        }
+        
+        @objc func tableViewDoubleClick(_ sender: NSTableView) {
+            let clickedRow = sender.clickedRow
+            guard clickedRow >= 0 && clickedRow < files.count else { return }
+            let file = files[clickedRow]
+            onDoubleClick(file.filePath)
+        }
+        
+        // MARK: - Drag and Drop Support
+        
+        func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+            guard row < files.count else { return nil }
+            let file = files[row]
+            return NSURL(fileURLWithPath: file.filePath)
+        }
+        
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+            // Drag all selected rows if the dragged row is in selection
+            // Otherwise just drag the single row
+        }
     }
 }
