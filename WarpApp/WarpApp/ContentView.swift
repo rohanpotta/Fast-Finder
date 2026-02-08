@@ -347,7 +347,8 @@ struct ContentView: View {
                         score: dateValue,
                         dateValue: dateValue,
                         dateKind: dateKind,
-                        fileKind: fileKind
+                        fileKind: fileKind,
+                        prettyDate: formatRelativeDate(dateValue)
                     ))
                 }
             }
@@ -391,6 +392,19 @@ struct ContentView: View {
         case "app": return "Application"
         default: return ext.isEmpty ? "Document" : "\(ext.uppercased()) File"
         }
+    }
+    
+    func formatRelativeDate(_ timestamp: Int64) -> String {
+        let now = Int64(Date().timeIntervalSince1970)
+        let diff = now - timestamp
+        
+        if diff < 60 { return "Just now" }
+        if diff < 3600 { return "\(diff / 60)m ago" }
+        if diff < 86400 { return "\(diff / 3600)h ago" }
+        if diff < 604800 { return "\(diff / 86400)d ago" }
+        if diff < 2592000 { return "\(diff / 604800)w ago" }
+        if diff < 31536000 { return "\(diff / 2592000)mo ago" }
+        return "\(diff / 31536000)y ago"
     }
 
     func runSearch(for text: String) {
@@ -664,11 +678,11 @@ struct FileTableView: NSViewRepresentable {
         nameColumn.minWidth = 200
         tableView.addTableColumn(nameColumn)
         
-        let kindColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("kind"))
-        kindColumn.title = "Kind"
-        kindColumn.width = 120
-        kindColumn.minWidth = 80
-        tableView.addTableColumn(kindColumn)
+        let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
+        sizeColumn.title = "Size"
+        sizeColumn.width = 80
+        sizeColumn.minWidth = 60
+        tableView.addTableColumn(sizeColumn)
         
         let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
         dateColumn.title = "Date"
@@ -684,8 +698,8 @@ struct FileTableView: NSViewRepresentable {
         tableView.target = context.coordinator
         tableView.doubleAction = #selector(Coordinator.tableViewDoubleClick(_:))
         
-        // Enable drag and drop
-        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        // Enable drag and drop (use .every for move/copy/delete support)
+        tableView.setDraggingSourceOperationMask(.every, forLocal: false)
         tableView.registerForDraggedTypes([.fileURL])
         
         context.coordinator.tableView = tableView
@@ -736,6 +750,7 @@ struct FileTableView: NSViewRepresentable {
         var onDoubleClick: (String) -> Void
         var onSelectionChange: (Set<String>) -> Void
         weak var tableView: NSTableView?
+        var iconCache: [String: NSImage] = [:]  // Cache icons to avoid repeated disk access
         
         init(files: [SearchResult], selection: Set<String>, onDoubleClick: @escaping (String) -> Void, onSelectionChange: @escaping (Set<String>) -> Void) {
             self.files = files
@@ -751,61 +766,104 @@ struct FileTableView: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard row < files.count else { return nil }
             let file = files[row]
+            let columnId = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("")
             
-            let cellView = NSTableCellView()
+            // 1. TRY TO RECYCLE AN EXISTING CELL
+            var cellView = tableView.makeView(withIdentifier: columnId, owner: self) as? NSTableCellView
             
-            if tableColumn?.identifier.rawValue == "name" {
-                let stackView = NSStackView()
-                stackView.orientation = .horizontal
-                stackView.spacing = 6
+            // 2. IF NO RECYCLABLE CELL EXISTS, CREATE ONE
+            if cellView == nil {
+                cellView = NSTableCellView()
+                cellView?.identifier = columnId
                 
-                // Icon
-                let icon = NSWorkspace.shared.icon(forFile: file.filePath)
-                icon.size = NSSize(width: 16, height: 16)
-                let imageView = NSImageView(image: icon)
-                imageView.imageScaling = .scaleProportionallyUpOrDown
-                imageView.setContentHuggingPriority(.required, for: .horizontal)
-                
-                // Text
-                let textField = NSTextField(labelWithString: file.fileName)
-                textField.lineBreakMode = .byTruncatingTail
-                
-                stackView.addArrangedSubview(imageView)
-                stackView.addArrangedSubview(textField)
-                
-                cellView.addSubview(stackView)
-                stackView.translatesAutoresizingMaskIntoConstraints = false
-                NSLayoutConstraint.activate([
-                    stackView.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
-                    stackView.trailingAnchor.constraint(equalTo: cellView.trailingAnchor, constant: -4),
-                    stackView.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
-                ])
-            } else if tableColumn?.identifier.rawValue == "kind" {
-                let textField = NSTextField(labelWithString: file.fileKind)
-                textField.textColor = .secondaryLabelColor
-                cellView.addSubview(textField)
-                textField.translatesAutoresizingMaskIntoConstraints = false
-                NSLayoutConstraint.activate([
-                    textField.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
-                    textField.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
-                ])
-            } else if tableColumn?.identifier.rawValue == "date" {
-                let date = Date(timeIntervalSince1970: TimeInterval(file.dateValue))
-                let formatter = RelativeDateTimeFormatter()
-                formatter.unitsStyle = .abbreviated
-                let dateStr = formatter.localizedString(for: date, relativeTo: Date())
-                
-                let textField = NSTextField(labelWithString: dateStr)
-                textField.textColor = .secondaryLabelColor
-                cellView.addSubview(textField)
-                textField.translatesAutoresizingMaskIntoConstraints = false
-                NSLayoutConstraint.activate([
-                    textField.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 4),
-                    textField.centerYAnchor.constraint(equalTo: cellView.centerYAnchor)
-                ])
+                if columnId.rawValue == "name" {
+                    let stack = NSStackView()
+                    stack.orientation = .horizontal
+                    stack.spacing = 6
+                    
+                    let img = NSImageView()
+                    img.imageScaling = .scaleProportionallyUpOrDown
+                    img.setContentHuggingPriority(.required, for: .horizontal)
+                    img.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([
+                        img.widthAnchor.constraint(equalToConstant: 16),
+                        img.heightAnchor.constraint(equalToConstant: 16)
+                    ])
+                    
+                    let txt = NSTextField()
+                    txt.isBordered = false
+                    txt.drawsBackground = false
+                    txt.lineBreakMode = .byTruncatingTail
+                    
+                    stack.addArrangedSubview(img)
+                    stack.addArrangedSubview(txt)
+                    cellView?.addSubview(stack)
+                    
+                    stack.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([
+                        stack.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
+                        stack.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -4),
+                        stack.centerYAnchor.constraint(equalTo: cellView!.centerYAnchor)
+                    ])
+                    cellView?.imageView = img
+                    cellView?.textField = txt
+                } else {
+                    // Simple text columns (Size, Date)
+                    let txt = NSTextField()
+                    txt.isBordered = false
+                    txt.drawsBackground = false
+                    txt.textColor = .secondaryLabelColor
+                    cellView?.addSubview(txt)
+                    
+                    txt.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([
+                        txt.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
+                        txt.centerYAnchor.constraint(equalTo: cellView!.centerYAnchor),
+                        txt.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -4)
+                    ])
+                    cellView?.textField = txt
+                }
+            }
+            
+            // 3. POPULATE DATA (runs for both new and recycled cells)
+            if columnId.rawValue == "name" {
+                // Async icon loading with cache
+                let filePath = file.filePath
+                if let cachedIcon = iconCache[filePath] {
+                    cellView?.imageView?.image = cachedIcon
+                } else {
+                    // Set placeholder first
+                    cellView?.imageView?.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil)
+                    
+                    // Load async
+                    DispatchQueue.global(qos: .userInitiated).async { [weak cellView] in
+                        let icon = NSWorkspace.shared.icon(forFile: filePath)
+                        DispatchQueue.main.async {
+                            self.iconCache[filePath] = icon
+                            cellView?.imageView?.image = icon
+                        }
+                    }
+                }
+                cellView?.textField?.stringValue = file.fileName
+            } else if columnId.rawValue == "size" {
+                cellView?.textField?.stringValue = formatFileSize(file.fileSize)
+            } else if columnId.rawValue == "date" {
+                // Use pre-formatted date from Rust (no formatter on main thread!)
+                cellView?.textField?.stringValue = file.prettyDate
             }
             
             return cellView
+        }
+        
+        // Helper to format file size
+        func formatFileSize(_ bytes: UInt64) -> String {
+            if bytes < 1024 { return "\(bytes) B" }
+            let kb = Double(bytes) / 1024
+            if kb < 1024 { return String(format: "%.1f KB", kb) }
+            let mb = kb / 1024
+            if mb < 1024 { return String(format: "%.1f MB", mb) }
+            let gb = mb / 1024
+            return String(format: "%.1f GB", gb)
         }
         
         func tableViewSelectionDidChange(_ notification: Notification) {

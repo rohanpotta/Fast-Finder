@@ -598,10 +598,11 @@ public struct SearchResult: Equatable, Hashable {
     public var dateValue: Int64
     public var dateKind: String
     public var fileKind: String
+    public var prettyDate: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fileName: String, filePath: String, fileSize: UInt64, isFolder: Bool, score: Int64, dateValue: Int64, dateKind: String, fileKind: String) {
+    public init(fileName: String, filePath: String, fileSize: UInt64, isFolder: Bool, score: Int64, dateValue: Int64, dateKind: String, fileKind: String, prettyDate: String) {
         self.fileName = fileName
         self.filePath = filePath
         self.fileSize = fileSize
@@ -610,6 +611,7 @@ public struct SearchResult: Equatable, Hashable {
         self.dateValue = dateValue
         self.dateKind = dateKind
         self.fileKind = fileKind
+        self.prettyDate = prettyDate
     }
 
     
@@ -633,7 +635,8 @@ public struct FfiConverterTypeSearchResult: FfiConverterRustBuffer {
                 score: FfiConverterInt64.read(from: &buf), 
                 dateValue: FfiConverterInt64.read(from: &buf), 
                 dateKind: FfiConverterString.read(from: &buf), 
-                fileKind: FfiConverterString.read(from: &buf)
+                fileKind: FfiConverterString.read(from: &buf), 
+                prettyDate: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -646,6 +649,7 @@ public struct FfiConverterTypeSearchResult: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.dateValue, into: &buf)
         FfiConverterString.write(value.dateKind, into: &buf)
         FfiConverterString.write(value.fileKind, into: &buf)
+        FfiConverterString.write(value.prettyDate, into: &buf)
     }
 }
 

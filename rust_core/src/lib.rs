@@ -21,6 +21,26 @@ pub struct SearchResult {
     pub date_value: i64,
     pub date_kind: String,
     pub file_kind: String,
+    #[serde(default)]
+    pub pretty_date: String,  // Pre-formatted relative date
+}
+
+// Format relative date in Rust (faster than Swift UI thread)
+fn format_relative_date(timestamp: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    
+    let diff = now - timestamp;
+    
+    if diff < 60 { return "Just now".to_string(); }
+    if diff < 3600 { return format!("{}m ago", diff / 60); }
+    if diff < 86400 { return format!("{}h ago", diff / 3600); }
+    if diff < 604800 { return format!("{}d ago", diff / 86400); }
+    if diff < 2592000 { return format!("{}w ago", diff / 604800); }
+    if diff < 31536000 { return format!("{}mo ago", diff / 2592000); }
+    format!("{}y ago", diff / 31536000)
 }
 
 // Cache structure for persistence
@@ -196,6 +216,7 @@ pub fn rebuild_index() -> Vec<SearchResult> {
                                 date_value,
                                 date_kind: date_kind.to_string(),
                                 file_kind,
+                                pretty_date: format_relative_date(date_value),
                             });
                         }
                     }
@@ -277,6 +298,7 @@ pub fn search_files(query: String) -> Vec<SearchResult> {
                                 date_value,
                                 date_kind: date_kind.to_string(),
                                 file_kind,
+                                pretty_date: format_relative_date(date_value),
                             });
                         } else {
                             return ignore::WalkState::Quit;
