@@ -49,13 +49,33 @@ struct AIActionPlan: Decodable, Equatable {
 actor AIService {
     static let shared = AIService()
     
-    /// API key from Config.xcconfig → Info.plist (never commit Config.xcconfig). Fallback: UserDefaults if set at runtime.
+    /// API key: read from Config.xcconfig (copied into app bundle; keep that file gitignored). Fallback: UserDefaults.
     private var apiKey: String? {
-        if let key = Bundle.main.object(forInfoDictionaryKey: "API_Key") as? String, !key.isEmpty, key != "your-anthropic-api-key-here" {
-            return key
+        // 1. Config.xcconfig in the app bundle (added to Copy Bundle Resources)
+        if let configPath = Bundle.main.path(forResource: "Config", ofType: "xcconfig"),
+           let contents = try? String(contentsOfFile: configPath, encoding: .utf8) {
+            let key = parseAPIKey(from: contents)
+            if let key = key, !key.isEmpty, key != "your-anthropic-api-key-here" {
+                return key
+            }
         }
-        let stored = UserDefaults.standard.string(forKey: "claude_api_key")
-        return stored?.isEmpty == false ? stored : nil
+        // 2. UserDefaults (e.g. if set in-app later)
+        if let stored = UserDefaults.standard.string(forKey: "claude_api_key"), !stored.isEmpty {
+            return stored
+        }
+        return nil
+    }
+    
+    private func parseAPIKey(from xcconfigContents: String) -> String? {
+        for line in xcconfigContents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("API_KEY") else { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count >= 2 {
+                return parts[1].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
     }
     
     // MARK: - Public API
@@ -125,21 +145,25 @@ actor AIService {
         """
         You are a file operation assistant. Return ONLY a JSON object.
         
-        CRITICAL: The app already ran a search. The list below IS the search result. You MUST choose one or more paths from this list as source_paths and return moveFiles, trashFiles, or compressFiles. Do NOT return action "search" — search was already done.
+        CRITICAL: The app already ran a search. The list below contains ALL search results (one path per line).
+        
+        DETERMINISM: If the user said "all", "every", or a plural ("screenshots", "pdfs"), you MUST include EVERY matching path in source_paths. One file = only when the user clearly asked for a single item. "Move all screenshots" = every file that is a screenshot (name contains "screenshot" or is an image type).
         
         ALLOWED ACTIONS (only these): moveFiles, trashFiles, compressFiles.
-        NOT ALLOWED: search.
+        NOT ALLOWED: search (already done).
         
-        FOUND FILES (pick source_paths from this list only):
+        SEARCH RESULTS (use these exact paths in source_paths):
         \(fileContext)
         
         USER REQUEST: "\(userQuery)"
         
-        TASK: Match the user's request to the files above. Use the EXACT full path(s) from the list for source_paths. For moveFiles set destination to a full folder path (e.g. /Users/username/Desktop/folderName). If the user said "a folder named X", use a path like \(currentFolder)/X.
+        INSTRUCTIONS:
+        1. Copy the EXACT paths from the list for every file that matches the user's intent. For "all screenshots" = every path that looks like a screenshot (name or type).
+        2. source_paths = array of every matching path; do not omit any.
+        3. For moveFiles, set destination to a full folder path. If user said "a folder named X", use \(currentFolder)/X.
         
-        Return JSON only, e.g.:
-        {"action":"moveFiles","source_paths":["/full/path/to/file.pdf"],"destination":"/full/path/to/folder","explanation":"Moving file to folder"}
-        No markdown, no search action.
+        Return JSON only:
+        {"action":"moveFiles","source_paths":["/path/to/file1.png","/path/to/file2.png",...],"destination":"/path/to/folder","explanation":"Moving N files to folder"}
         """
     }
     
@@ -156,18 +180,20 @@ actor AIService {
         
         CURRENT FOLDER: \(currentFolder)
         
-        FILES IN THIS FOLDER:
+        FILES IN THIS FOLDER (each object has "path", "name", "kind" — use the exact "path" for source_paths):
         \(fileContext)
         
         USER REQUEST: "\(userQuery)"
         
-        INSTRUCTIONS:
-        1. If any file in the list above matches the request, use moveFiles/trashFiles/compressFiles with their FULL paths
-        2. If zero files match, return action "search" with a "query" string to search the system
-        3. source_paths must be EXACT paths from the list; for moveFiles set destination to a full folder path
+        CRITICAL RULES FOR DETERMINISM:
+        1. When the user says "all", "every", or a plural ("screenshots", "pdfs", "the images"), you MUST include EVERY matching file in source_paths. Do not include only one.
+        2. Matching: "screenshots" = any file whose name contains "screenshot" or "Screenshot", or kind is image (PNG, JPEG, etc.). "PDFs" = kind PDF or name contains ".pdf". When in doubt, include any file that reasonably matches.
+        3. source_paths must be the exact "path" values from the list above (copy them verbatim).
+        4. If zero files in the list match, return action "search" with a "query" string so we can search the system.
+        5. For moveFiles, destination = full folder path; if user said "a folder named X", use \(currentFolder)/X.
         
         Return JSON only (no markdown):
-        {"action":"moveFiles","source_paths":["/path/..."],"destination":"/path/...","explanation":"..."}
+        {"action":"moveFiles","source_paths":["/exact/path/1","/exact/path/2",...],"destination":"/path/to/folder","explanation":"Moving N files to folder"}
         or {"action":"search","query":"search terms","explanation":"..."}
         """
     }

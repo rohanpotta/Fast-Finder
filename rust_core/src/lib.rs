@@ -166,8 +166,10 @@ pub fn get_file_listing_for_ai(path: String) -> String {
                 let (date_val, _) = get_best_date(&meta);
                 let age_days = (now - date_val) / 86400;
                 
+                let full_path = path.to_string_lossy().into_owned();
                 files.push(serde_json::json!({
                     "name": name,
+                    "path": full_path,
                     "size": size,
                     "kind": kind,
                     "age_days": age_days
