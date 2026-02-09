@@ -749,6 +749,16 @@ public func createFolder(path: String) -> FileOpResult  {
     )
 })
 }
+/**
+ * Get a compact file listing for AI context (saves tokens)
+ */
+public func getFileListingForAi(path: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_get_file_listing_for_ai(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
 public func getRecentFiles() -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_get_recent_files($0
@@ -835,6 +845,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_create_folder() != 32855) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_get_file_listing_for_ai() != 40135) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {

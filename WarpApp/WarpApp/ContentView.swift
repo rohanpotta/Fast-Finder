@@ -72,10 +72,28 @@ struct ContentView: View {
     @State private var showRenameSheet = false
     @State private var renameText = ""
     @State private var showMovePanel = false
+    
+    // AI state
+    @State private var showAIBar = false
+    @State private var aiPrefilledPlan: AIActionPlan?
+    
+    // Drill-in navigation (open folder = show only its contents; Back pops)
+    @State private var navigationPathStack: [String] = []
+    
+    /// The folder path we're currently viewing (drilled-in path or sidebar selection).
+    private var effectiveCurrentPath: String? {
+        if let last = navigationPathStack.last { return last }
+        return selectedSidebarItem == .recents ? nil : selectedSidebarItem.path
+    }
+    
+    /// Expand/collapse folders in the main file list (arrow = expand inline).
+    @State private var loadedFolderContents: [String: [SearchResult]] = [:]
+    /// Path we just loaded so the outline view can reload that item.
+    @State private var lastExpandedPath: String? = nil
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            // --- SIDEBAR ---
+            // --- SIDEBAR (flat Favorites / Locations) ---
             List(selection: $selectedSidebarItem) {
                 Section("Favorites") {
                     ForEach([SidebarItem.recents, .desktop, .documents, .downloads], id: \.self) { item in
@@ -86,7 +104,6 @@ struct ContentView: View {
                             }
                     }
                 }
-                
                 Section("Locations") {
                     ForEach([SidebarItem.user, .applications, .trash], id: \.self) { item in
                         Label(item.displayName, systemImage: item.icon)
@@ -100,11 +117,33 @@ struct ContentView: View {
             .listStyle(.sidebar)
             .frame(minWidth: 180)
             .onChange(of: selectedSidebarItem) { newItem in
+                navigationPathStack = []
+                loadedFolderContents.removeAll()
                 loadFolder(newItem)
             }
         } detail: {
             // --- MAIN CONTENT AREA ---
             VStack(spacing: 0) {
+                // Back button when drilled into a subfolder
+                if !navigationPathStack.isEmpty {
+                    HStack(spacing: 8) {
+                        Button(action: goBack) {
+                            Image(systemName: "chevron.left")
+                            Text("Back")
+                        }
+                        .buttonStyle(.plain)
+                        Text((navigationPathStack.last as NSString?)?.lastPathComponent ?? "")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+                    Divider()
+                }
+                
                 // Search Bar
                 HStack {
                     Image(systemName: "magnifyingglass")
@@ -125,14 +164,33 @@ struct ContentView: View {
                 
                 Divider()
 
-                // --- TABLE VIEW (NSTableView for double-click support) ---
-                FileTableView(
+                // --- OUTLINE VIEW (arrow = expand folder inline; double-click = go into folder) ---
+                FileOutlineView(
                     files: sortedResults,
                     selection: $selectedFileIds,
-                    onDoubleClick: { path in
-                        openFile(path)
+                    loadedFolderContents: loadedFolderContents,
+                    lastExpandedPath: $lastExpandedPath,
+                    onFolderExpanded: { path in
+                        guard loadedFolderContents[path] == nil else { return }
+                        Task {
+                            let contents = await Task.detached(priority: .userInitiated) {
+                                loadDirectoryContents(path: path, showHidden: false)
+                            }.value
+                            await MainActor.run {
+                                loadedFolderContents[path] = contents.sorted(using: sortOrder)
+                                lastExpandedPath = path
+                            }
+                        }
                     },
-                    onContextMenu: { _ in }
+                    onDoubleClick: { path in
+                        let allShown = sortedResults + loadedFolderContents.values.flatMap { $0 }
+                        let isFolder = allShown.first { $0.filePath == path }?.isFolder ?? false
+                        if isFolder {
+                            navigateIntoFolder(path)
+                        } else {
+                            openFile(path)
+                        }
+                    }
                 )
                 .contextMenu {
                     // Quick Look (single file only)
@@ -228,7 +286,7 @@ struct ContentView: View {
                     if let path = selectedFileIds.first {
                         let result = renameFile(path: path, newName: newName)
                         if result.success {
-                            loadFolder(selectedSidebarItem)
+                            refreshCurrentContent()
                         }
                     }
                     showRenameSheet = false
@@ -236,6 +294,34 @@ struct ContentView: View {
                 onCancel: { showRenameSheet = false }
             )
         }
+        // AI Input Overlay (Cmd+K)
+        .overlay(alignment: .top) {
+            if showAIBar {
+                AIInputBar(
+                    isPresented: $showAIBar,
+                    currentFolder: .constant(effectiveCurrentPath ?? selectedSidebarItem.path),
+                    selectedFiles: .constant(Array(selectedFileIds)),
+                    prefilledPlan: $aiPrefilledPlan,
+                    onExecute: { plan, userQuery in
+                        executeAIPlan(plan, userQuery: userQuery)
+                        if plan.action != .search {
+                            showAIBar = false
+                        }
+                    }
+                )
+                .padding(.top, 60)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.3), value: showAIBar)
+        // Cmd+K to toggle AI bar - using background button for keyboard shortcut
+        .background(
+            Button("") {
+                showAIBar.toggle()
+            }
+            .keyboardShortcut("k", modifiers: .command)
+            .hidden()
+        )
     }
     
     // Sorted results based on current sort order
@@ -245,25 +331,139 @@ struct ContentView: View {
     
     // --- ACTIONS ---
     
+    func executeAIPlan(_ plan: AIActionPlan, userQuery: String) {
+        // Handle search: run search, then re-call AI with results so it can return moveFiles/trash/etc.
+        if plan.action == .search {
+            let searchQuery = plan.searchQuery ?? userQuery
+            print("🔍 AI searching for: \(searchQuery)")
+            self.query = searchQuery
+            Task {
+                let searchResults = await runSearchAndGetResults(for: searchQuery)
+                await MainActor.run {
+                    self.results = searchResults
+                    self.selectedFileIds = searchResults.first.map { [$0.filePath] } ?? []
+                }
+                do {
+                    let newPlan = try await AIService.shared.parseCommand(
+                        userQuery: userQuery,
+                        currentFolder: selectedSidebarItem.path,
+                        selectedFiles: [],
+                        recentSearchResults: searchResults
+                    )
+                    await MainActor.run {
+                        if newPlan.action == .search {
+                            // Still no files found; show the plan so user sees the message
+                            aiPrefilledPlan = newPlan
+                        } else {
+                            aiPrefilledPlan = newPlan
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        aiPrefilledPlan = AIActionPlan(
+                            action: .unknown,
+                            sourcePaths: nil,
+                            destination: nil,
+                            searchQuery: nil,
+                            explanation: "Search completed but couldn’t interpret next step: \(error.localizedDescription)"
+                        )
+                    }
+                }
+            }
+            return
+        }
+        
+        // For file operations, we need source paths
+        guard let paths = plan.sourcePaths, !paths.isEmpty else {
+            print("⚠️ AI returned no files to act on: \(plan.explanation)")
+            return
+        }
+        
+        switch plan.action {
+        case .moveFiles:
+            if let dest = plan.destination {
+                let result = moveFiles(sourcePaths: paths, destination: dest)
+                if result.success {
+                    print("✅ AI moved \(paths.count) files to \(dest)")
+                    refreshCurrentContent()
+                } else {
+                    print("❌ Move failed: \(result.message)")
+                }
+            }
+        case .trashFiles:
+            let result = trashFiles(paths: paths)
+            if result.success {
+                print("✅ AI trashed \(paths.count) files")
+                results.removeAll { paths.contains($0.filePath) }
+                selectedFileIds.removeAll()
+            } else {
+                print("❌ Trash failed: \(result.message)")
+            }
+        case .compressFiles:
+            let firstPath = paths[0] as NSString
+            let parentDir = firstPath.deletingLastPathComponent
+            let archivePath = "\(parentDir)/AI_Archive_\(Int(Date().timeIntervalSince1970)).zip"
+            
+            let result = compressFiles(paths: paths, archivePath: archivePath)
+            if result.success {
+                print("✅ AI compressed \(paths.count) files to \(archivePath)")
+                refreshCurrentContent()
+            } else {
+                print("❌ Compress failed: \(result.message)")
+            }
+        case .search, .unknown:
+            print("⚠️ Unhandled action: \(plan.action)")
+        }
+    }
+    
     func loadFolder(_ item: SidebarItem) {
         query = ""
-        
         if item == .recents {
             loadRecents()
             return
         }
-        
+        loadFolderContents(path: item.path, showHidden: item == .trash)
+    }
+    
+    /// Load a folder's contents into the main area (used for sidebar selection and drill-in).
+    func loadFolderContents(path: String, showHidden: Bool = false) {
+        loadedFolderContents.removeAll()
         Task {
-            let folderPath = item.path
-            let isTrash = (item == .trash)
             let contents = await Task.detached(priority: .userInitiated) {
-                return loadDirectoryContents(path: folderPath, showHidden: isTrash)
+                return loadDirectoryContents(path: path, showHidden: showHidden)
             }.value
-            
             await MainActor.run {
                 self.results = contents
                 self.selectedFileIds = contents.first.map { [$0.filePath] } ?? []
             }
+        }
+    }
+    
+    /// Push a subfolder and show only its contents (Back will pop).
+    func navigateIntoFolder(_ path: String) {
+        navigationPathStack.append(path)
+        loadFolderContents(path: path)
+    }
+    
+    /// Pop the drill-in stack and show the previous folder (or sidebar root).
+    func goBack() {
+        guard !navigationPathStack.isEmpty else { return }
+        navigationPathStack.removeLast()
+        if let path = navigationPathStack.last {
+            loadFolderContents(path: path)
+        } else {
+            refreshCurrentContent()
+        }
+    }
+    
+    /// Reload current view (after move/compress etc.).
+    func refreshCurrentContent() {
+        query = ""
+        if let path = effectiveCurrentPath {
+            let isTrash = (path == (FileManager.default.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".Trash"))
+            loadFolderContents(path: path, showHidden: isTrash)
+        } else {
+            loadRecents()
         }
     }
     
@@ -411,18 +611,12 @@ struct ContentView: View {
         searchTask?.cancel()
         
         if text.isEmpty {
-            loadFolder(selectedSidebarItem)
+            refreshCurrentContent()
             return
         }
         
         searchTask = Task {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            if Task.isCancelled { return }
-            
-            let newResults = await Task.detached(priority: .userInitiated) {
-                return searchFiles(query: text)
-            }.value
-            
+            let newResults = await runSearchAndGetResults(for: text)
             await MainActor.run {
                 self.results = newResults
                 self.selectedFileIds = newResults.first.map { [$0.filePath] } ?? []
@@ -430,11 +624,24 @@ struct ContentView: View {
         }
     }
     
+    /// Runs search and returns results (used by AI flow so we can pass results back to Claude).
+    func runSearchAndGetResults(for text: String) async -> [SearchResult] {
+        guard !text.isEmpty else { return [] }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        if Task.isCancelled { return [] }
+        return await Task.detached(priority: .userInitiated) {
+            searchFiles(query: text)
+        }.value
+    }
+    
     func openSelected() {
-        if let firstSelected = selectedFileIds.first {
-            openFile(firstSelected)
-        } else if let first = results.first {
-            openFile(first.filePath)
+        let path = selectedFileIds.first ?? results.first?.filePath
+        guard let path = path else { return }
+        let isFolder = results.first { $0.filePath == path }?.isFolder ?? false
+        if isFolder {
+            navigateIntoFolder(path)
+        } else {
+            openFile(path)
         }
     }
 
@@ -463,7 +670,7 @@ struct ContentView: View {
         
         if result.success {
             // Refresh to show the new archive
-            loadFolder(selectedSidebarItem)
+            refreshCurrentContent()
         }
     }
     
@@ -646,7 +853,264 @@ struct RenameSheet: View {
     }
 }
 
-// MARK: - NSTableView Wrapper for Double-Click Support
+// MARK: - NSOutlineView for Expandable Folders in File List
+
+struct FileOutlineView: NSViewRepresentable {
+    let files: [SearchResult]
+    @Binding var selection: Set<String>
+    let loadedFolderContents: [String: [SearchResult]]
+    @Binding var lastExpandedPath: String?
+    let onFolderExpanded: (String) -> Void
+    let onDoubleClick: (String) -> Void
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        let outlineView = NSOutlineView()
+        
+        scrollView.documentView = outlineView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        
+        outlineView.style = .inset
+        outlineView.usesAlternatingRowBackgroundColors = true
+        outlineView.allowsMultipleSelection = true
+        outlineView.rowHeight = 24
+        
+        let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        nameColumn.title = "Name"
+        nameColumn.width = 300
+        nameColumn.minWidth = 200
+        outlineView.addTableColumn(nameColumn)
+        
+        let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
+        sizeColumn.title = "Size"
+        sizeColumn.width = 80
+        sizeColumn.minWidth = 60
+        outlineView.addTableColumn(sizeColumn)
+        
+        let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
+        dateColumn.title = "Date"
+        dateColumn.width = 120
+        dateColumn.minWidth = 80
+        outlineView.addTableColumn(dateColumn)
+        
+        outlineView.outlineTableColumn = nameColumn
+        outlineView.delegate = context.coordinator
+        outlineView.dataSource = context.coordinator
+        outlineView.target = context.coordinator
+        outlineView.doubleAction = #selector(Coordinator.outlineViewDoubleClick(_:))
+        outlineView.setDraggingSourceOperationMask(.every, forLocal: false)
+        outlineView.registerForDraggedTypes([.fileURL])
+        
+        context.coordinator.outlineView = outlineView
+        return scrollView
+    }
+    
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let outlineView = scrollView.documentView as? NSOutlineView else { return }
+        
+        let rootChanged = context.coordinator.files.map(\.filePath) != files.map(\.filePath)
+        context.coordinator.files = files
+        context.coordinator.loadedFolderContents = loadedFolderContents
+        context.coordinator.selection = selection
+        context.coordinator.onFolderExpanded = onFolderExpanded
+        context.coordinator.onDoubleClick = onDoubleClick
+        
+        if rootChanged {
+            outlineView.reloadData()
+        }
+        
+        // If we just loaded a folder's contents, reload that item so children appear and keep it expanded
+        if let path = lastExpandedPath {
+            outlineView.reloadItem(path, reloadChildren: true)
+            outlineView.expandItem(path)
+            lastExpandedPath = nil
+        }
+        
+        // Sync selection by path
+        var indexSet = IndexSet()
+        for i in 0..<outlineView.numberOfRows {
+            if let item = outlineView.item(atRow: i) as? String, selection.contains(item) {
+                indexSet.insert(i)
+            }
+        }
+        if outlineView.selectedRowIndexes != indexSet {
+            outlineView.selectRowIndexes(indexSet, byExtendingSelection: false)
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            files: files,
+            loadedFolderContents: loadedFolderContents,
+            selection: selection,
+            onFolderExpanded: onFolderExpanded,
+            onDoubleClick: onDoubleClick,
+            onSelectionChange: { selection = $0 }
+        )
+    }
+    
+    class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
+        var files: [SearchResult]
+        var loadedFolderContents: [String: [SearchResult]]
+        var selection: Set<String>
+        var onFolderExpanded: (String) -> Void
+        var onDoubleClick: (String) -> Void
+        var onSelectionChange: (Set<String>) -> Void
+        weak var outlineView: NSOutlineView?
+        var iconCache: [String: NSImage] = [:]
+        
+        init(files: [SearchResult], loadedFolderContents: [String: [SearchResult]], selection: Set<String>, onFolderExpanded: @escaping (String) -> Void, onDoubleClick: @escaping (String) -> Void, onSelectionChange: @escaping (Set<String>) -> Void) {
+            self.files = files
+            self.loadedFolderContents = loadedFolderContents
+            self.selection = selection
+            self.onFolderExpanded = onFolderExpanded
+            self.onDoubleClick = onDoubleClick
+            self.onSelectionChange = onSelectionChange
+        }
+        
+        func searchResult(forPath path: String) -> SearchResult? {
+            files.first { $0.filePath == path } ?? loadedFolderContents.values.flatMap { $0 }.first { $0.filePath == path }
+        }
+        
+        // MARK: - NSOutlineViewDataSource
+        
+        func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+            if item == nil {
+                return files.count
+            }
+            guard let path = item as? String else { return 0 }
+            guard let result = searchResult(forPath: path), result.isFolder else { return 0 }
+            return loadedFolderContents[path]?.count ?? 0
+        }
+        
+        func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+            if item == nil {
+                return files[index].filePath
+            }
+            guard let path = item as? String, let children = loadedFolderContents[path], index < children.count else {
+                return "" as String
+            }
+            return children[index].filePath
+        }
+        
+        func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+            guard let path = item as? String else { return false }
+            return searchResult(forPath: path)?.isFolder ?? false
+        }
+        
+        // MARK: - NSOutlineViewDelegate (expand = load children)
+        
+        /// Called when user clicks the disclosure arrow; we get the item (path) directly and trigger load.
+        func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
+            guard let path = item as? String else { return false }
+            onFolderExpanded(path)
+            return true
+        }
+        
+        func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+            guard let path = item as? String, let file = searchResult(forPath: path) else { return nil }
+            let columnId = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("")
+            
+            var cellView = outlineView.makeView(withIdentifier: columnId, owner: self) as? NSTableCellView
+            if cellView == nil {
+                cellView = NSTableCellView()
+                cellView?.identifier = columnId
+                if columnId.rawValue == "name" {
+                    let stack = NSStackView()
+                    stack.orientation = .horizontal
+                    stack.spacing = 6
+                    let img = NSImageView()
+                    img.imageScaling = .scaleProportionallyUpOrDown
+                    img.setContentHuggingPriority(.required, for: .horizontal)
+                    img.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([img.widthAnchor.constraint(equalToConstant: 16), img.heightAnchor.constraint(equalToConstant: 16)])
+                    let txt = NSTextField()
+                    txt.isBordered = false
+                    txt.drawsBackground = false
+                    txt.lineBreakMode = .byTruncatingTail
+                    stack.addArrangedSubview(img)
+                    stack.addArrangedSubview(txt)
+                    cellView?.addSubview(stack)
+                    stack.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([
+                        stack.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
+                        stack.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -4),
+                        stack.centerYAnchor.constraint(equalTo: cellView!.centerYAnchor)
+                    ])
+                    cellView?.imageView = img
+                    cellView?.textField = txt
+                } else {
+                    let txt = NSTextField()
+                    txt.isBordered = false
+                    txt.drawsBackground = false
+                    txt.textColor = .secondaryLabelColor
+                    cellView?.addSubview(txt)
+                    txt.translatesAutoresizingMaskIntoConstraints = false
+                    NSLayoutConstraint.activate([
+                        txt.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
+                        txt.centerYAnchor.constraint(equalTo: cellView!.centerYAnchor),
+                        txt.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -4)
+                    ])
+                    cellView?.textField = txt
+                }
+            }
+            
+            if columnId.rawValue == "name" {
+                if let cached = iconCache[path] {
+                    cellView?.imageView?.image = cached
+                } else {
+                    cellView?.imageView?.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil)
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self, weak cellView] in
+                        let icon = NSWorkspace.shared.icon(forFile: path)
+                        DispatchQueue.main.async {
+                            self?.iconCache[path] = icon
+                            cellView?.imageView?.image = icon
+                        }
+                    }
+                }
+                cellView?.textField?.stringValue = file.fileName
+            } else if columnId.rawValue == "size" {
+                cellView?.textField?.stringValue = formatFileSize(file.fileSize)
+            } else if columnId.rawValue == "date" {
+                cellView?.textField?.stringValue = file.prettyDate
+            }
+            return cellView
+        }
+        
+        func formatFileSize(_ bytes: UInt64) -> String {
+            if bytes < 1024 { return "\(bytes) B" }
+            let kb = Double(bytes) / 1024
+            if kb < 1024 { return String(format: "%.1f KB", kb) }
+            return String(format: "%.1f MB", kb / 1024)
+        }
+        
+        func outlineViewSelectionDidChange(_ notification: Notification) {
+            guard let ov = notification.object as? NSOutlineView else { return }
+            var newSelection = Set<String>()
+            for i in ov.selectedRowIndexes {
+                if let item = ov.item(atRow: i) as? String {
+                    newSelection.insert(item)
+                }
+            }
+            onSelectionChange(newSelection)
+        }
+        
+        @objc func outlineViewDoubleClick(_ sender: NSOutlineView) {
+            let row = sender.clickedRow
+            guard row >= 0, let item = sender.item(atRow: row) as? String else { return }
+            onDoubleClick(item)
+        }
+        
+        func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+            guard let item = outlineView.item(atRow: row) as? String else { return nil }
+            return NSURL(fileURLWithPath: item)
+        }
+    }
+}
+
+// MARK: - NSTableView Wrapper for Double-Click Support (kept for reference; use FileOutlineView for main list)
 
 struct FileTableView: NSViewRepresentable {
     let files: [SearchResult]

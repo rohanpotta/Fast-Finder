@@ -258,6 +258,11 @@ RustBuffer uniffi_rust_core_fn_func_copy_files(RustBuffer source_paths, RustBuff
 RustBuffer uniffi_rust_core_fn_func_create_folder(RustBuffer path, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_FILE_LISTING_FOR_AI
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_FILE_LISTING_FOR_AI
+RustBuffer uniffi_rust_core_fn_func_get_file_listing_for_ai(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustCallStatus *_Nonnull out_status
@@ -571,6 +576,12 @@ uint16_t uniffi_rust_core_checksum_func_copy_files(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CREATE_FOLDER
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CREATE_FOLDER
 uint16_t uniffi_rust_core_checksum_func_create_folder(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_FILE_LISTING_FOR_AI
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_FILE_LISTING_FOR_AI
+uint16_t uniffi_rust_core_checksum_func_get_file_listing_for_ai(void
     
 );
 #endif

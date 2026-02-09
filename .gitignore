@@ -6,6 +6,10 @@
 **/*.rs.bk
 Cargo.lock
 
+# --- Xcode (secrets: never commit API keys) ---
+Config.xcconfig
+**/Config.xcconfig
+
 # --- Xcode ---
 build/
 DerivedData/

@@ -141,6 +141,44 @@ pub fn load_cached_index() -> Vec<SearchResult> {
     cache.files
 }
 
+/// Get a compact file listing for AI context (saves tokens)
+#[uniffi::export]
+pub fn get_file_listing_for_ai(path: String) -> String {
+    use std::fs;
+    
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(&path) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        
+        for entry in entries.filter_map(|e| e.ok()).take(100) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            
+            if let Ok(meta) = entry.metadata() {
+                let is_dir = meta.is_dir();
+                let size = if is_dir { 0 } else { meta.len() };
+                let kind = get_file_kind(&path, is_dir);
+                
+                let (date_val, _) = get_best_date(&meta);
+                let age_days = (now - date_val) / 86400;
+                
+                files.push(serde_json::json!({
+                    "name": name,
+                    "size": size,
+                    "kind": kind,
+                    "age_days": age_days
+                }));
+            }
+        }
+    }
+    
+    serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Rebuild the index and save to cache (call in background)
 #[uniffi::export]
 pub fn rebuild_index() -> Vec<SearchResult> {

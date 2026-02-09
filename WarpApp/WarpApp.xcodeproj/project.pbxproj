@@ -29,6 +29,7 @@
 		EBEC4D362F132CAA00FF24D5 /* WarpApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WarpApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBEC4D4D2F13301400FF24D5 /* librust_core.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = librust_core.dylib; path = ../rust_core/target/debug/librust_core.dylib; sourceTree = "<group>"; };
 		EBEC4D512F13308800FF24D5 /* WarpApp-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "WarpApp-Bridging-Header.h"; sourceTree = "<group>"; };
+		EBEC4D522F13309900FF24D5 /* Config.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -55,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				EBEC4D512F13308800FF24D5 /* WarpApp-Bridging-Header.h */,
+				EBEC4D522F13309900FF24D5 /* Config.xcconfig */,
 				EBEC4D382F132CAA00FF24D5 /* WarpApp */,
 				EBEC4D4C2F13301300FF24D5 /* Frameworks */,
 				EBEC4D372F132CAA00FF24D5 /* Products */,
@@ -160,6 +162,7 @@
 /* Begin XCBuildConfiguration section */
 		EBEC4D3F2F132CAB00FF24D5 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = EBEC4D522F13309900FF24D5 /* Config.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -223,6 +226,7 @@
 		};
 		EBEC4D402F132CAB00FF24D5 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = EBEC4D522F13309900FF24D5 /* Config.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -287,6 +291,7 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_API_Key = "$(API_KEY)";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -321,6 +326,7 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_API_Key = "$(API_KEY)";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
