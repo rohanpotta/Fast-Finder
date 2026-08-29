@@ -50,6 +50,26 @@ pub fn open_default() -> rusqlite::Result<Connection> {
     open(&default_db_path())
 }
 
+/// Read a value from the `settings` key/value table. Missing key → None.
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        rusqlite::params![key],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Write a value into the `settings` table, replacing any existing entry.
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
     // WAL: concurrent reads while indexer writes; survives crashes cleanly.
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -59,6 +79,10 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
     // Larger cache helps the hot path (search) avoid spilling to disk.
     conn.pragma_update(None, "cache_size", -64_000)?; // 64MB
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // WAL still allows only one writer at a time, and the incremental indexer
+    // can collide with a full rescan. Without a timeout the loser gets an
+    // immediate SQLITE_BUSY and the update is silently dropped.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(())
 }
 
@@ -152,6 +176,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn settings_round_trip_and_overwrite() {
+        let conn = fresh_conn();
+        assert_eq!(get_setting(&conn, "missing"), None);
+
+        set_setting(&conn, "last_event_id", "42").unwrap();
+        assert_eq!(get_setting(&conn, "last_event_id").as_deref(), Some("42"));
+
+        // Second write for the same key replaces rather than erroring on the PK.
+        set_setting(&conn, "last_event_id", "99").unwrap();
+        assert_eq!(get_setting(&conn, "last_event_id").as_deref(), Some("99"));
     }
 
     #[test]
