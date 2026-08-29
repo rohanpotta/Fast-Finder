@@ -718,6 +718,16 @@ fileprivate struct FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer 
     }
 }
 /**
+ * Returns true if there is at least one reversible block that hasn't been
+ * undone — the Swift menu uses this to enable/disable the Cmd+Z menu item.
+ */
+public func canUndo() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_can_undo($0
+    )
+})
+}
+/**
  * Compress files into a ZIP archive
  */
 public func compressFiles(paths: [String], archivePath: String) -> FileOpResult  {
@@ -766,7 +776,9 @@ public func getRecentFiles() -> [SearchResult]  {
 })
 }
 /**
- * Load cached index for instant startup
+ * Load the persisted index for instant startup.
+ * Returns rows ordered by best-date desc; capped to 50k to keep the FFI
+ * crossing cheap. If the DB isn't openable yet (first launch race), returns [].
  */
 public func loadCachedIndex() -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
@@ -795,7 +807,7 @@ public func rebuildIndex() -> [SearchResult]  {
 })
 }
 /**
- * Rename a file
+ * Rename a file. `new_name` must be a basename (no `/`, no `..`).
  */
 public func renameFile(path: String, newName: String) -> FileOpResult  {
     return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
@@ -822,6 +834,17 @@ public func trashFiles(paths: [String]) -> FileOpResult  {
     )
 })
 }
+/**
+ * Undo the most recent reversible, still-executed block. Returns an
+ * affected_count of 0 with success=false when there's nothing to undo
+ * (UI should treat that as a no-op, not an error).
+ */
+public func undoLastBlock() -> FileOpResult  {
+    return try!  FfiConverterTypeFileOpResult_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_undo_last_block($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -838,6 +861,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_rust_core_checksum_func_can_undo() != 16121) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_compress_files() != 27291) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -853,7 +879,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_load_cached_index() != 33893) {
+    if (uniffi_rust_core_checksum_func_load_cached_index() != 38582) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_move_files() != 44044) {
@@ -862,13 +888,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_rebuild_index() != 17457) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_rename_file() != 59089) {
+    if (uniffi_rust_core_checksum_func_rename_file() != 42280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_search_files() != 43504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_trash_files() != 51150) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_undo_last_block() != 37958) {
         return InitializationResult.apiChecksumMismatch
     }
 

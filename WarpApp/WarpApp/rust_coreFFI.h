@@ -243,6 +243,12 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_CAN_UNDO
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_CAN_UNDO
+int8_t uniffi_rust_core_fn_func_can_undo(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COMPRESS_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_COMPRESS_FILES
 RustBuffer uniffi_rust_core_fn_func_compress_files(RustBuffer paths, RustBuffer archive_path, RustCallStatus *_Nonnull out_status
@@ -299,6 +305,12 @@ RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustCallStatu
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_TRASH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_TRASH_FILES
 RustBuffer uniffi_rust_core_fn_func_trash_files(RustBuffer paths, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_UNDO_LAST_BLOCK
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_UNDO_LAST_BLOCK
+RustBuffer uniffi_rust_core_fn_func_undo_last_block(RustCallStatus *_Nonnull out_status
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_RUST_CORE_RUSTBUFFER_ALLOC
@@ -561,6 +573,12 @@ void ffi_rust_core_rust_future_free_void(uint64_t handle
 void ffi_rust_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CAN_UNDO
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_CAN_UNDO
+uint16_t uniffi_rust_core_checksum_func_can_undo(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COMPRESS_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_COMPRESS_FILES
 uint16_t uniffi_rust_core_checksum_func_compress_files(void
@@ -624,6 +642,12 @@ uint16_t uniffi_rust_core_checksum_func_search_files(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_TRASH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_TRASH_FILES
 uint16_t uniffi_rust_core_checksum_func_trash_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_UNDO_LAST_BLOCK
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_UNDO_LAST_BLOCK
+uint16_t uniffi_rust_core_checksum_func_undo_last_block(void
     
 );
 #endif
