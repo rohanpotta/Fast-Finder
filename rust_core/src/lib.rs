@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use ignore::WalkBuilder;
 use rusqlite::params;
@@ -132,6 +134,196 @@ fn extract_times(metadata: &std::fs::Metadata) -> (i64, i64) {
     (mtime, ctime)
 }
 
+// ============== INDEXING POLICY ==============
+//
+// The full rescan and the incremental updater MUST agree on what belongs in
+// the index. If they diverge, `index_paths` will happily insert rows that the
+// next `rebuild_index` prunes (or vice versa) and the index starts flickering.
+// Everything that decides "is this path in scope" lives in this section.
+
+/// Directory depth below a scan root that we index, matching the walker's
+/// `max_depth`. Root itself is depth 0, its children depth 1.
+const MAX_SCAN_DEPTH: usize = 5;
+
+/// Folders the indexer walks.
+fn scan_roots() -> Vec<String> {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    vec![
+        format!("{}/Documents", home),
+        format!("{}/Downloads", home),
+        format!("{}/Desktop", home),
+    ]
+}
+
+fn allowed_extensions() -> &'static HashSet<&'static str> {
+    static EXTS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    EXTS.get_or_init(|| {
+        [
+            "pdf", "doc", "docx", "txt", "rtf", "md", "pages", "odt",
+            "xls", "xlsx", "csv", "numbers",
+            "ppt", "pptx", "key",
+            "jpg", "jpeg", "png", "gif", "heic", "webp", "svg", "psd", "ai",
+            "mp4", "mov", "avi", "mkv", "webm",
+            "mp3", "wav", "aac", "flac", "m4a",
+            "py", "js", "ts", "rs", "swift", "java", "go", "html", "css", "json",
+            "zip", "tar", "gz", "rar", "7z", "dmg",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// Extension policy, mirroring the filter inside the parallel walker:
+///   - anything with an extension must be on the allow-list (this also drops
+///     oddly-named directories like `my.backup`, same as the walker)
+///   - a file with no extension is skipped; a directory with none is kept
+fn extension_allows(path: &Path, is_dir: bool) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => allowed_extensions().contains(ext.to_lowercase().as_str()),
+        None => is_dir,
+    }
+}
+
+/// The scan root containing `path`, if any. Returned so callers can compute
+/// depth and scope prune statements to a single root.
+fn scan_root_for(path: &Path) -> Option<String> {
+    scan_roots()
+        .into_iter()
+        .find(|root| path.starts_with(root))
+}
+
+/// Full eligibility check for a single path: inside a scan root, within the
+/// depth limit, not hidden, and extension-allowed.
+///
+/// Note: the full rescan additionally honours `.gitignore` via `WalkBuilder`.
+/// We deliberately don't reimplement that for single-file events — the cost of
+/// a stray indexed row is far lower than the cost of getting ignore-file
+/// semantics subtly wrong in two places. Directory events re-walk through
+/// `WalkBuilder`, so subtrees stay exact.
+fn is_indexable(path: &Path, is_dir: bool) -> bool {
+    let Some(root) = scan_root_for(path) else {
+        return false;
+    };
+    let Ok(rel) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for component in rel.components() {
+        depth += 1;
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with('.') {
+            return false;
+        }
+    }
+    if depth > MAX_SCAN_DEPTH {
+        return false;
+    }
+    extension_allows(path, is_dir)
+}
+
+/// Build the FFI record plus the raw (mtime, ctime) we persist alongside it.
+fn record_for(path: &Path, metadata: &fs::Metadata) -> (SearchResult, i64, i64) {
+    let is_folder = metadata.is_dir();
+    let (mtime, ctime) = extract_times(metadata);
+    let (date_value, date_kind) = get_best_date(metadata);
+    (
+        SearchResult {
+            file_name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            file_path: path.to_string_lossy().into_owned(),
+            file_size: metadata.len(),
+            is_folder,
+            score: date_value,
+            date_value,
+            date_kind: date_kind.to_string(),
+            file_kind: get_file_kind(path, is_folder),
+            pretty_date: format_relative_date(date_value),
+        },
+        mtime,
+        ctime,
+    )
+}
+
+/// UPSERT on `path` so file ids stay stable across reindexes — `blocks` and
+/// `embeddings` FK into `files(id)` and must not be orphaned by a rescan.
+const UPSERT_FILE_SQL: &str = "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ON CONFLICT(path) DO UPDATE SET
+         name       = excluded.name,
+         parent_dir = excluded.parent_dir,
+         ext        = excluded.ext,
+         size       = excluded.size,
+         is_dir     = excluded.is_dir,
+         mtime      = excluded.mtime,
+         ctime      = excluded.ctime,
+         file_kind  = excluded.file_kind,
+         indexed_at = excluded.indexed_at";
+
+/// Bind one record to a prepared `UPSERT_FILE_SQL` statement.
+fn upsert_record(
+    stmt: &mut rusqlite::Statement,
+    r: &SearchResult,
+    mtime: i64,
+    ctime: i64,
+    indexed_at: i64,
+) -> rusqlite::Result<usize> {
+    let p = Path::new(&r.file_path);
+    let parent = p
+        .parent()
+        .map(|x| x.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
+    stmt.execute(params![
+        r.file_path,
+        r.file_name,
+        parent,
+        ext,
+        r.file_size as i64,
+        r.is_folder as i64,
+        mtime,
+        ctime,
+        r.file_kind,
+        indexed_at,
+    ])
+}
+
+/// Walk one directory subtree, collecting every indexable entry.
+fn collect_subtree(root: &str, max_depth: usize) -> Vec<(SearchResult, i64, i64)> {
+    let collected: Arc<Mutex<Vec<(SearchResult, i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .max_depth(Some(max_depth))
+        .threads(4)
+        .build_parallel();
+
+    let sink = collected.clone();
+    walker.run(move || {
+        let sink = sink.clone();
+        Box::new(move |entry_result| {
+            if let Ok(entry) = entry_result {
+                let path = entry.path();
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                if !extension_allows(path, is_dir) {
+                    return ignore::WalkState::Continue;
+                }
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(mut lock) = sink.lock() {
+                        lock.push(record_for(path, &metadata));
+                    }
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    let out = collected.lock().map(|l| l.clone()).unwrap_or_default();
+    out
+}
+
 /// Load the persisted index for instant startup.
 /// Returns rows ordered by best-date desc; capped to 50k to keep the FFI
 /// crossing cheap. If the DB isn't openable yet (first launch race), returns [].
@@ -198,149 +390,35 @@ pub fn get_file_listing_for_ai(path: String) -> String {
     serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Rebuild the index and save to cache (call in background)
+/// Full rescan of every scan root. Expensive: this walks the whole tree, so
+/// the app should call it on first run or when the incremental event stream
+/// has gone stale — `index_paths` handles the steady state.
 #[uniffi::export]
 pub fn rebuild_index() -> Vec<SearchResult> {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    
-    let scan_folders = vec![
-        format!("{}/Documents", home),
-        format!("{}/Downloads", home),
-        format!("{}/Desktop", home),
-    ];
-    
-    let allowed_extensions: std::collections::HashSet<&str> = [
-        "pdf", "doc", "docx", "txt", "rtf", "md", "pages", "odt",
-        "xls", "xlsx", "csv", "numbers",
-        "ppt", "pptx", "key",
-        "jpg", "jpeg", "png", "gif", "heic", "webp", "svg", "psd", "ai",
-        "mp4", "mov", "avi", "mkv", "webm",
-        "mp3", "wav", "aac", "flac", "m4a",
-        "py", "js", "ts", "rs", "swift", "java", "go", "html", "css", "json",
-        "zip", "tar", "gz", "rar", "7z", "dmg",
-    ].iter().cloned().collect();
-    
-    // Tuple Vec so we can persist raw (mtime, ctime) alongside the
-    // FFI-visible SearchResult without bloating its public shape.
-    let collected_mutex: Arc<Mutex<Vec<(SearchResult, i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let scan_folders = scan_roots();
 
+    let mut collected: Vec<(SearchResult, i64, i64)> = Vec::new();
     for folder in &scan_folders {
-        if !std::path::Path::new(folder).exists() {
+        if !Path::new(folder).exists() {
             continue;
         }
-
-        let results_clone = collected_mutex.clone();
-        let allowed_ext = allowed_extensions.clone();
-
-        let walker = WalkBuilder::new(folder)
-            .hidden(true)
-            .git_ignore(true)
-            .max_depth(Some(5))
-            .threads(4)
-            .build_parallel();
-
-        walker.run(move || {
-            let results = results_clone.clone();
-            let allowed_ext = allowed_ext.clone();
-
-            Box::new(move |entry_result| {
-                if let Ok(entry) = entry_result {
-                    let path = entry.path();
-
-                    if let Some(ext) = path.extension() {
-                        let ext_lower = ext.to_string_lossy().to_lowercase();
-                        if !allowed_ext.contains(ext_lower.as_str()) {
-                            return ignore::WalkState::Continue;
-                        }
-                    } else if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                        return ignore::WalkState::Continue;
-                    }
-
-                    if let Ok(metadata) = entry.metadata() {
-                        let is_folder = metadata.is_dir();
-                        let (mtime, ctime) = extract_times(&metadata);
-                        let (date_value, date_kind) = get_best_date(&metadata);
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let path_str = path.to_string_lossy().to_string();
-                        let file_kind = get_file_kind(path, is_folder);
-
-                        if let Ok(mut lock) = results.lock() {
-                            lock.push((
-                                SearchResult {
-                                    file_name: name,
-                                    file_path: path_str,
-                                    file_size: metadata.len(),
-                                    is_folder,
-                                    score: date_value,
-                                    date_value,
-                                    date_kind: date_kind.to_string(),
-                                    file_kind,
-                                    pretty_date: format_relative_date(date_value),
-                                },
-                                mtime,
-                                ctime,
-                            ));
-                        }
-                    }
-                }
-                ignore::WalkState::Continue
-            })
-        });
+        collected.extend(collect_subtree(folder, MAX_SCAN_DEPTH));
     }
-
-    let mut collected = collected_mutex.lock().unwrap().clone();
     collected.sort_by(|a, b| b.0.date_value.cmp(&a.0.date_value));
 
-    // Persist to SQLite. UPSERT on path so stable file ids survive across
-    // rebuilds — the blocks table FKs into files(id) and we must not nuke
-    // those references on every scan. After the inserts, tombstone-prune any
-    // rows under a scan root that we *didn't* re-touch (i.e. files removed
-    // from disk since last index).
     if let Ok(mut conn) = db::open_default() {
         let now = blocks::now_ts();
         if let Ok(tx) = conn.transaction() {
             {
-                let stmt = tx.prepare(
-                    "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT(path) DO UPDATE SET
-                         name       = excluded.name,
-                         parent_dir = excluded.parent_dir,
-                         ext        = excluded.ext,
-                         size       = excluded.size,
-                         is_dir     = excluded.is_dir,
-                         mtime      = excluded.mtime,
-                         ctime      = excluded.ctime,
-                         file_kind  = excluded.file_kind,
-                         indexed_at = excluded.indexed_at",
-                ).ok();
-
-                if let Some(mut stmt) = stmt {
+                if let Ok(mut stmt) = tx.prepare(UPSERT_FILE_SQL) {
                     for (r, mtime, ctime) in &collected {
-                        let p = std::path::Path::new(&r.file_path);
-                        let parent = p.parent()
-                            .map(|x| x.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let ext = p.extension()
-                            .map(|e| e.to_string_lossy().to_lowercase());
-                        let _ = stmt.execute(params![
-                            r.file_path,
-                            r.file_name,
-                            parent,
-                            ext,
-                            r.file_size as i64,
-                            r.is_folder as i64,
-                            mtime,
-                            ctime,
-                            r.file_kind,
-                            now,
-                        ]);
+                        let _ = upsert_record(&mut stmt, r, *mtime, *ctime, now);
                     }
                 }
 
                 // Tombstone-prune: any row under a scan root whose indexed_at
-                // is older than this run was not re-visited and must have
-                // been removed/renamed/moved. CASCADE drops dependent rows.
+                // is older than this run was not re-visited and must have been
+                // removed/renamed/moved. CASCADE drops dependent rows.
                 if let Ok(mut prune) = tx.prepare(
                     "DELETE FROM files
                      WHERE indexed_at < ?1
@@ -353,9 +431,194 @@ pub fn rebuild_index() -> Vec<SearchResult> {
             }
             let _ = tx.commit();
         }
+        // Stamp the completion so the app can tell whether the incremental
+        // stream is still trustworthy on next launch.
+        let _ = db::set_setting(&conn, SETTING_LAST_FULL_SCAN, &now.to_string());
     }
 
     collected.into_iter().map(|(sr, _, _)| sr).collect()
+}
+
+// ============== INCREMENTAL INDEXING ==============
+
+/// Settings keys backing the incremental pipeline.
+const SETTING_LAST_FULL_SCAN: &str = "last_full_scan_at";
+const SETTING_LAST_EVENT_ID: &str = "fsevents_last_id";
+
+/// How long a full rescan stays trustworthy. Past this we assume the FSEvents
+/// stream may have dropped something and re-walk from scratch.
+const FULL_SCAN_MAX_AGE_SECS: i64 = 60 * 60 * 24;
+
+/// What one incremental pass changed. Returned so the UI can skip a refresh
+/// when nothing actually moved.
+#[derive(uniffi::Record, Clone)]
+pub struct IndexUpdate {
+    pub upserted: u32,
+    pub removed: u32,
+}
+
+impl IndexUpdate {
+    fn empty() -> Self {
+        IndexUpdate { upserted: 0, removed: 0 }
+    }
+
+    /// True when the pass was a no-op — FSEvents fires for plenty of paths we
+    /// don't index, so this is the common case.
+    pub fn is_noop(&self) -> bool {
+        self.upserted == 0 && self.removed == 0
+    }
+}
+
+/// Reconcile the index against a specific set of paths, as reported by
+/// FSEvents. This is the steady-state path: it touches only what changed
+/// instead of re-walking every scan root.
+///
+/// For each path:
+///   - gone from disk → delete its row, plus every row beneath it (a deleted
+///     or renamed directory takes its whole subtree with it)
+///   - a directory → re-walk that subtree and tombstone-prune it, which also
+///     covers the coalesced `MustScanSubDirs` events FSEvents sends under load
+///   - a file → upsert if indexable, otherwise make sure it isn't lingering
+///
+/// Paths outside the scan roots are ignored, so the caller can forward the
+/// raw event list without pre-filtering.
+#[uniffi::export]
+pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
+    if paths.is_empty() {
+        return IndexUpdate::empty();
+    }
+    let Ok(mut conn) = db::open_default() else {
+        return IndexUpdate::empty();
+    };
+
+    let now = blocks::now_ts();
+    let mut upserted: u32 = 0;
+    let mut removed: u32 = 0;
+
+    let Ok(tx) = conn.transaction() else {
+        return IndexUpdate::empty();
+    };
+    {
+        let (Ok(mut upsert), Ok(mut delete_subtree), Ok(mut children_of)) = (
+            tx.prepare(UPSERT_FILE_SQL),
+            // `path = ?1` catches the entry itself; the LIKE catches a deleted
+            // directory's descendants, which FSEvents does not enumerate.
+            tx.prepare("DELETE FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'"),
+            tx.prepare("SELECT path FROM files WHERE path LIKE ?1 || '/%'"),
+        ) else {
+            return IndexUpdate::empty();
+        };
+
+        for raw in &paths {
+            let path = Path::new(raw);
+            if !path.is_absolute() || scan_root_for(path).is_none() {
+                continue;
+            }
+
+            // symlink_metadata: a symlink is indexed as itself, and a dangling
+            // one reads as "exists" rather than following into nothing.
+            match fs::symlink_metadata(path) {
+                Err(_) => {
+                    removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
+                }
+                Ok(meta) if meta.is_dir() => {
+                    if !is_indexable(path, true) {
+                        removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
+                        continue;
+                    }
+                    // Re-walk the subtree with the depth budget it would have
+                    // had during a full scan, so a deep directory event can't
+                    // pull in rows the full rescan would later prune.
+                    let root_depth = scan_root_for(path)
+                        .and_then(|root| path.strip_prefix(&root).ok().map(|r| r.components().count()))
+                        .unwrap_or(0);
+                    let budget = MAX_SCAN_DEPTH.saturating_sub(root_depth);
+
+                    let found = collect_subtree(raw, budget);
+                    let on_disk: HashSet<&str> =
+                        found.iter().map(|(r, _, _)| r.file_path.as_str()).collect();
+
+                    for (r, mtime, ctime) in &found {
+                        if upsert_record(&mut upsert, r, *mtime, *ctime, now).is_ok() {
+                            upserted += 1;
+                        }
+                    }
+
+                    // Prune by diffing against what we just walked rather than
+                    // by `indexed_at < now`: two events landing in the same
+                    // wall-clock second would make a timestamp comparison skip
+                    // genuinely stale rows.
+                    let stale: Vec<String> = children_of
+                        .query_map(params![raw], |r| r.get::<_, String>(0))
+                        .map(|rows| {
+                            rows.filter_map(|r| r.ok())
+                                .filter(|p| !on_disk.contains(p.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for p in stale {
+                        removed += delete_subtree.execute(params![p]).unwrap_or(0) as u32;
+                    }
+                }
+                Ok(meta) => {
+                    if is_indexable(path, false) {
+                        let (r, mtime, ctime) = record_for(path, &meta);
+                        if upsert_record(&mut upsert, &r, mtime, ctime, now).is_ok() {
+                            upserted += 1;
+                        }
+                    } else {
+                        // Renamed into a non-indexed extension, or newly
+                        // hidden — drop any row we were still holding.
+                        removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
+                    }
+                }
+            }
+        }
+    }
+    let _ = tx.commit();
+
+    IndexUpdate { upserted, removed }
+}
+
+/// True when the app should run a full `rebuild_index` instead of relying on
+/// the incremental stream: nothing indexed yet, or the last full scan is old
+/// enough that we can't trust having seen every event since.
+#[uniffi::export]
+pub fn needs_full_rescan() -> bool {
+    let Ok(conn) = db::open_default() else {
+        return true;
+    };
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        return true;
+    }
+    match db::get_setting(&conn, SETTING_LAST_FULL_SCAN).and_then(|v| v.parse::<i64>().ok()) {
+        Some(last) => blocks::now_ts() - last > FULL_SCAN_MAX_AGE_SECS,
+        None => true,
+    }
+}
+
+/// Last FSEvents id we have already folded into the index, or 0 if none.
+/// The app passes this back as the stream's `sinceWhen` so a relaunch replays
+/// only what changed while it was closed instead of re-walking everything.
+#[uniffi::export]
+pub fn last_event_id() -> u64 {
+    let Ok(conn) = db::open_default() else {
+        return 0;
+    };
+    db::get_setting(&conn, SETTING_LAST_EVENT_ID)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the FSEvents id reached after a successful `index_paths` pass.
+#[uniffi::export]
+pub fn set_last_event_id(id: u64) {
+    if let Ok(conn) = db::open_default() {
+        let _ = db::set_setting(&conn, SETTING_LAST_EVENT_ID, &id.to_string());
+    }
 }
 
 /// Sanitize free-text user input into an FTS5 query: replace non-alphanumeric
@@ -1553,5 +1816,190 @@ mod tests {
         let recents = get_recent_files();
         assert_eq!(recents.len(), 1, "only the recent file should appear");
         assert_eq!(recents[0].file_name, "fresh.txt");
+    }
+
+    // MARK: - indexing policy
+
+    /// db_scope() points HOME at a tempdir, so scan_roots() resolves under it.
+    fn docs_root(scope: &DbScope) -> std::path::PathBuf {
+        let docs = scope.path().join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        docs
+    }
+
+    #[test]
+    fn test_is_indexable_scope_rules() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+
+        assert!(is_indexable(&docs.join("report.pdf"), false));
+        // Extension not on the allow-list.
+        assert!(!is_indexable(&docs.join("core.dump"), false));
+        // A file with no extension is skipped; a directory with none is kept.
+        assert!(!is_indexable(&docs.join("Makefile"), false));
+        assert!(is_indexable(&docs.join("Projects"), true));
+        // Hidden anywhere in the relative path.
+        assert!(!is_indexable(&docs.join(".secret.pdf"), false));
+        assert!(!is_indexable(&docs.join(".cache/report.pdf"), false));
+        // Outside every scan root.
+        assert!(!is_indexable(&_scope.path().join("Movies/clip.mp4"), false));
+        // Past the depth budget (root + 6 components).
+        let deep = docs.join("a/b/c/d/e/f.pdf");
+        assert!(!is_indexable(&deep, false));
+        assert!(is_indexable(&docs.join("a/b/c/d/e.pdf"), false));
+    }
+
+    #[test]
+    fn test_index_paths_upserts_a_new_file() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let f = docs.join("notes.md");
+        fs::write(&f, "hello").unwrap();
+
+        let update = index_paths(vec![f.to_string_lossy().into_owned()]);
+        assert_eq!(update.upserted, 1);
+        assert_eq!(update.removed, 0);
+
+        // Reachable through FTS, i.e. the mirror triggers fired.
+        let hits = search_files("notes".to_string());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_path, f.to_string_lossy());
+    }
+
+    #[test]
+    fn test_index_paths_is_idempotent() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let f = docs.join("notes.md");
+        fs::write(&f, "hello").unwrap();
+        let arg = vec![f.to_string_lossy().into_owned()];
+
+        index_paths(arg.clone());
+        index_paths(arg.clone());
+
+        let conn = db::open_default().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "re-indexing the same path must not duplicate rows");
+    }
+
+    #[test]
+    fn test_index_paths_removes_a_deleted_file() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let f = docs.join("gone.md");
+        fs::write(&f, "x").unwrap();
+        let arg = vec![f.to_string_lossy().into_owned()];
+
+        assert_eq!(index_paths(arg.clone()).upserted, 1);
+        fs::remove_file(&f).unwrap();
+
+        let update = index_paths(arg);
+        assert_eq!(update.removed, 1);
+        assert!(search_files("gone".to_string()).is_empty());
+    }
+
+    #[test]
+    fn test_index_paths_ignores_paths_outside_scan_roots() {
+        let _scope = db_scope();
+        let movies = _scope.path().join("Movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        let f = movies.join("clip.mp4");
+        fs::write(&f, "x").unwrap();
+
+        let update = index_paths(vec![f.to_string_lossy().into_owned()]);
+        assert!(update.is_noop(), "outside a scan root, nothing should change");
+    }
+
+    #[test]
+    fn test_index_paths_walks_a_directory_and_prunes_its_deletions() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let proj = docs.join("Project");
+        std::fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.md"), "a").unwrap();
+        fs::write(proj.join("b.md"), "b").unwrap();
+        let arg = vec![proj.to_string_lossy().into_owned()];
+
+        // The directory row itself plus both files.
+        let first = index_paths(arg.clone());
+        assert_eq!(first.upserted, 3);
+        assert_eq!(first.removed, 0);
+
+        // FSEvents coalesces: we only hear about the directory, not b.md.
+        fs::remove_file(proj.join("b.md")).unwrap();
+        let second = index_paths(arg);
+        assert_eq!(second.removed, 1, "b.md should be pruned by the subtree diff");
+        assert!(search_files("b".to_string()).is_empty());
+        assert_eq!(search_files("a".to_string()).len(), 1);
+    }
+
+    #[test]
+    fn test_index_paths_deleted_directory_takes_its_subtree() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let proj = docs.join("Project");
+        std::fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.md"), "a").unwrap();
+        let arg = vec![proj.to_string_lossy().into_owned()];
+        assert_eq!(index_paths(arg.clone()).upserted, 2);
+
+        std::fs::remove_dir_all(&proj).unwrap();
+        let update = index_paths(arg);
+        // The directory row and the file beneath it.
+        assert_eq!(update.removed, 2);
+        assert!(search_files("a".to_string()).is_empty());
+    }
+
+    #[test]
+    fn test_index_paths_drops_a_file_renamed_to_an_unindexed_extension() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let old = docs.join("notes.md");
+        fs::write(&old, "x").unwrap();
+        assert_eq!(index_paths(vec![old.to_string_lossy().into_owned()]).upserted, 1);
+
+        let new = docs.join("notes.dump");
+        fs::rename(&old, &new).unwrap();
+
+        // FSEvents reports both sides of a rename.
+        let update = index_paths(vec![
+            old.to_string_lossy().into_owned(),
+            new.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(update.removed, 1, "the old path is gone from disk");
+        assert_eq!(update.upserted, 0, "the new extension is not indexed");
+        assert!(search_files("notes".to_string()).is_empty());
+    }
+
+    #[test]
+    fn test_needs_full_rescan_when_index_is_empty() {
+        let _scope = db_scope();
+        assert!(needs_full_rescan(), "an empty index always needs a full scan");
+    }
+
+    #[test]
+    fn test_needs_full_rescan_false_after_a_recent_scan() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        fs::write(docs.join("a.md"), "a").unwrap();
+
+        rebuild_index();
+        assert!(!needs_full_rescan(), "a fresh full scan should be trusted");
+
+        // Age the stamp past the trust window.
+        let conn = db::open_default().unwrap();
+        let stale = blocks::now_ts() - FULL_SCAN_MAX_AGE_SECS - 1;
+        db::set_setting(&conn, SETTING_LAST_FULL_SCAN, &stale.to_string()).unwrap();
+        assert!(needs_full_rescan(), "a stale scan stamp should force a rescan");
+    }
+
+    #[test]
+    fn test_last_event_id_round_trip() {
+        let _scope = db_scope();
+        assert_eq!(last_event_id(), 0, "no stored id yet");
+        set_last_event_id(918_273_645);
+        assert_eq!(last_event_id(), 918_273_645);
     }
 }
