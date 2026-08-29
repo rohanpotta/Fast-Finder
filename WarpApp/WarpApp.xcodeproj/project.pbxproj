@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		EBEC4D4E2F13301400FF24D5 /* librust_core.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = EBEC4D4D2F13301400FF24D5 /* librust_core.dylib */; };
 		EBEC4D4F2F13301400FF24D5 /* librust_core.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = EBEC4D4D2F13301400FF24D5 /* librust_core.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
-		EBEC4D532F1330AA00FF24D5 /* Config.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = EBEC4D522F13309900FF24D5 /* Config.xcconfig */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -145,7 +144,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				EBEC4D532F1330AA00FF24D5 /* Config.xcconfig in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

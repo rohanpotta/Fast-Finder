@@ -63,33 +63,16 @@ actor AIService {
         }
     }
 
-    /// API key: Keychain first, then Config.xcconfig (bundled placeholder for
-    /// dev builds). UserDefaults is no longer consulted — it was plaintext on
-    /// disk in `~/Library/Preferences/...plist`.
+    /// API key: Keychain only.
+    ///
+    /// There used to be a fallback that read `Config.xcconfig` out of the app
+    /// bundle. That file was in Copy Bundle Resources, so the key shipped
+    /// inside `WarpApp.app/Contents/Resources/` in plaintext — readable by
+    /// anyone handed a build. Gitignoring it protected the repo, not the
+    /// binary. Keychain is now the only source; Settings is where you set it.
     private var apiKey: String? {
-        if let keychainKey = KeychainHelper.load(), !keychainKey.isEmpty {
-            return keychainKey
-        }
-        if let configPath = Bundle.main.path(forResource: "Config", ofType: "xcconfig"),
-           let contents = try? String(contentsOfFile: configPath, encoding: .utf8) {
-            let key = parseAPIKey(from: contents)
-            if let key = key, !key.isEmpty, key != "your-anthropic-api-key-here" {
-                return key
-            }
-        }
-        return nil
-    }
-
-    private func parseAPIKey(from xcconfigContents: String) -> String? {
-        for line in xcconfigContents.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("API_KEY") else { continue }
-            let parts = trimmed.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            if parts.count >= 2 {
-                return parts[1].trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return nil
+        guard let key = KeychainHelper.load(), !key.isEmpty else { return nil }
+        return key
     }
 
     // MARK: - Public API
@@ -317,7 +300,7 @@ enum AIError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noApiKey:
-            return "No API key configured."
+            return "No API key configured. Add one in Settings (⌘,) → AI Assistant."
         case .networkError(let msg):
             return "Network error: \(msg)"
         case .apiError(let msg):
