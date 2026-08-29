@@ -267,12 +267,9 @@ struct ContentView: View {
         .frame(minWidth: 750, minHeight: 500)
         .background(WarpTheme.background)
         .background(QuickLookHost())
-        .task { loadFolder(.recents) }
-        .onAppear {
-            fileWatcher.onChange = { [self] in
-                refreshCurrentContent()
-            }
-            fileWatcher.start()
+        .task {
+            loadFolder(.recents)
+            await startWatching()
         }
         .onChange(of: selectedSidebarItem) { newItem in
             withAnimation(.spring(response: 0.3)) {
@@ -568,40 +565,73 @@ struct ContentView: View {
     }
 
     func loadRecents() {
-        // INSTANT: Load cached data first for immediate display
+        // One indexed query, already filtered and capped in SQL. The old path
+        // pulled the whole index (up to 50k rows) across the FFI boundary and
+        // then filtered it in Swift.
         Task {
-            let cachedFiles = await Task.detached(priority: .userInitiated) {
-                return loadCachedIndex()
+            let recent = await Task.detached(priority: .userInitiated) {
+                return getRecentFiles()
             }.value
 
             await MainActor.run {
-                if self.query.isEmpty && !cachedFiles.isEmpty {
-                    // Filter to last 7 days and show immediately
-                    let weekAgo = Date().timeIntervalSince1970 - (60 * 60 * 24 * 7)
-                    let recent = cachedFiles
-                        .filter { Double($0.dateValue) > weekAgo }
-                        .sorted { $0.dateValue > $1.dateValue }
-                        .prefix(50)
-                    self.results = Array(recent)
-                    self.selectedFileIds = self.results.first.map { [$0.filePath] } ?? []
+                guard self.query.isEmpty, self.selectedSidebarItem == .recents else { return }
+                self.results = recent
+                self.selectedFileIds = recent.first.map { [$0.filePath] } ?? []
+            }
+        }
+    }
+
+    // MARK: - Index maintenance
+
+    /// Resume the FSEvents stream where the last run left off, then bring the
+    /// index up to date. A full rescan only runs on first launch or when the
+    /// stream has gone stale — the steady state is `indexPaths` on each batch.
+    private func startWatching() async {
+        // Read the resume point before any rescan, then run the rescan to
+        // completion before the stream goes live. That keeps the full scan and
+        // the incremental writer off each other's toes, and costs nothing:
+        // anything that changed during the scan is still replayed, because we
+        // resume from the pre-scan id and indexing a path twice is a no-op.
+        let resumeId = await Task.detached(priority: .utility) { lastEventId() }.value
+
+        if await Task.detached(priority: .utility) { needsFullRescan() }.value {
+            _ = await Task.detached(priority: .background) { rebuildIndex() }.value
+            await MainActor.run {
+                if query.isEmpty { refreshCurrentContent() }
+            }
+        }
+
+        fileWatcher.onChange = { batch in
+            handleFileChanges(batch)
+        }
+        fileWatcher.start(sinceEventId: resumeId)
+    }
+
+    /// Fold one FSEvents batch into the index and refresh only if it actually
+    /// changed something — most batches touch paths we don't index.
+    private func handleFileChanges(_ batch: FileChangeBatch) {
+        Task {
+            let changed = await Task.detached(priority: .utility) { () -> Bool in
+                if batch.needsFullRescan {
+                    _ = rebuildIndex()
+                    return true
                 }
+                let update = indexPaths(paths: batch.paths)
+                return update.upserted > 0 || update.removed > 0
+            }.value
+
+            // Only advance the resume point once the batch is durably indexed,
+            // so a crash mid-batch replays it instead of losing it.
+            if batch.latestEventId > 0 {
+                await Task.detached(priority: .utility) {
+                    setLastEventId(id: batch.latestEventId)
+                }.value
             }
 
-            // BACKGROUND: Rebuild index for fresh data
-            let freshFiles = await Task.detached(priority: .background) {
-                return rebuildIndex()
-            }.value
-
+            guard changed else { return }
             await MainActor.run {
-                if self.query.isEmpty && self.selectedSidebarItem == .recents {
-                    let weekAgo = Date().timeIntervalSince1970 - (60 * 60 * 24 * 7)
-                    let recent = freshFiles
-                        .filter { Double($0.dateValue) > weekAgo }
-                        .sorted { $0.dateValue > $1.dateValue }
-                        .prefix(50)
-                    self.results = Array(recent)
-                    self.selectedFileIds = self.results.first.map { [$0.filePath] } ?? []
-                }
+                // Don't yank the list out from under an active search.
+                if query.isEmpty { refreshCurrentContent() }
             }
         }
     }
