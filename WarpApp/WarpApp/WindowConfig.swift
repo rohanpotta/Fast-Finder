@@ -22,8 +22,8 @@ struct WindowAccessor: NSViewRepresentable {
                 window.standardWindowButton(.miniaturizeButton)?.isHidden = true
                 window.standardWindowButton(.zoomButton)?.isHidden = true
                 
-                window.isOpaque = false
-                window.backgroundColor = .clear
+                window.isOpaque = true
+                window.backgroundColor = WarpTheme.nsBackground
                 window.isMovableByWindowBackground = true
             }
         }
