@@ -246,6 +246,16 @@ fn record_for(path: &Path, metadata: &fs::Metadata) -> (SearchResult, i64, i64) 
     )
 }
 
+/// Matches every row strictly beneath the directory bound to `?1`.
+///
+/// Deliberately not `path LIKE ?1 || '/%'`: `%` and `_` are ordinary,
+/// common characters in filenames but SQL wildcards in LIKE, so a folder
+/// named `tax_2025` would also match `taxX2025` and a prune would delete
+/// index rows for unrelated files. A range over the `path` unique index is
+/// exact — every descendant sorts between `dir/` and `dir0`, because '0' is
+/// the next code point after '/'.
+const DESCENDANTS_OF: &str = "path > ?1 || '/' AND path < ?1 || '0'";
+
 /// UPSERT on `path` so file ids stay stable across reindexes — `blocks` and
 /// `embeddings` FK into `files(id)` and must not be orphaned by a rescan.
 const UPSERT_FILE_SQL: &str = "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
@@ -419,10 +429,11 @@ pub fn rebuild_index() -> Vec<SearchResult> {
                 // Tombstone-prune: any row under a scan root whose indexed_at
                 // is older than this run was not re-visited and must have been
                 // removed/renamed/moved. CASCADE drops dependent rows.
+                // Range rather than LIKE, for the reason on DESCENDANTS_OF.
                 if let Ok(mut prune) = tx.prepare(
                     "DELETE FROM files
                      WHERE indexed_at < ?1
-                       AND (path LIKE ?2 || '/%')",
+                       AND (path > ?2 || '/' AND path < ?2 || '0')",
                 ) {
                     for folder in &scan_folders {
                         let _ = prune.execute(params![now, folder]);
@@ -501,10 +512,14 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
     {
         let (Ok(mut upsert), Ok(mut delete_subtree), Ok(mut children_of)) = (
             tx.prepare(UPSERT_FILE_SQL),
-            // `path = ?1` catches the entry itself; the LIKE catches a deleted
-            // directory's descendants, which FSEvents does not enumerate.
-            tx.prepare("DELETE FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'"),
-            tx.prepare("SELECT path FROM files WHERE path LIKE ?1 || '/%'"),
+            // `path = ?1` catches the entry itself; the range catches a
+            // deleted directory's descendants, which FSEvents does not
+            // enumerate. See DESCENDANTS_OF on why this isn't a LIKE.
+            tx.prepare(&format!(
+                "DELETE FROM files WHERE path = ?1 OR ({})",
+                DESCENDANTS_OF
+            )),
+            tx.prepare(&format!("SELECT path FROM files WHERE {}", DESCENDANTS_OF)),
         ) else {
             return IndexUpdate::empty();
         };
@@ -1993,6 +2008,88 @@ mod tests {
         let stale = blocks::now_ts() - FULL_SCAN_MAX_AGE_SECS - 1;
         db::set_setting(&conn, SETTING_LAST_FULL_SCAN, &stale.to_string()).unwrap();
         assert!(needs_full_rescan(), "a stale scan stamp should force a rescan");
+    }
+
+    #[test]
+    fn test_index_paths_prune_does_not_treat_filenames_as_sql_wildcards() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+
+        // `_` is a single-character wildcard in LIKE and utterly ordinary in a
+        // folder name. `tax_2025` must not reach into `taxX2025`.
+        let target = docs.join("tax_2025");
+        let bystander = docs.join("taxX2025");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&bystander).unwrap();
+        fs::write(target.join("a.md"), "a").unwrap();
+        fs::write(bystander.join("b.md"), "b").unwrap();
+
+        index_paths(vec![
+            target.to_string_lossy().into_owned(),
+            bystander.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(search_files("b".to_string()).len(), 1, "precondition");
+
+        // Re-index only `tax_2025`. Nothing under `taxX2025` may be pruned.
+        index_paths(vec![target.to_string_lossy().into_owned()]);
+
+        let conn = db::open_default().unwrap();
+        let survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                rusqlite::params![bystander.join("b.md").to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1, "a sibling folder must not be pruned by a wildcard match");
+    }
+
+    #[test]
+    fn test_file_ops_refuse_a_symlink_pointing_at_a_sensitive_path() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+
+        // The classic shape: something that arrives inside an archive.
+        let secret_dir = _scope.path().join(".ssh");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("id_rsa");
+        fs::write(&secret, "PRIVATE KEY MATERIAL").unwrap();
+
+        let bait = docs.join("invoice.pdf");
+        std::os::unix::fs::symlink(&secret, &bait).unwrap();
+
+        let dest = docs.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let copied = copy_files(
+            vec![bait.to_string_lossy().into_owned()],
+            dest.to_string_lossy().into_owned(),
+        );
+        assert!(!copied.success, "copying through a symlink into ~/.ssh must be refused");
+        assert!(!dest.join("invoice.pdf").exists(), "no key material may be materialised");
+
+        let archive = docs.join("out.zip");
+        let zipped = compress_files(
+            vec![bait.to_string_lossy().into_owned()],
+            archive.to_string_lossy().into_owned(),
+        );
+        assert!(!zipped.success, "archiving through the same symlink must be refused");
+    }
+
+    #[test]
+    fn test_move_refuses_launch_agents_as_destination() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let src = docs.join("payload.json");
+        fs::write(&src, "{}").unwrap();
+
+        let launch_agents = _scope.path().join("Library/LaunchAgents");
+        let result = move_files(
+            vec![src.to_string_lossy().into_owned()],
+            launch_agents.to_string_lossy().into_owned(),
+        );
+        assert!(!result.success, "LaunchAgents is code-execution at login");
+        assert!(src.exists(), "source must be untouched");
     }
 
     #[test]
