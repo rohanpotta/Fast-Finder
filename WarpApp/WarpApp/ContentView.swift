@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Quartz // For Quick Look preview
+import QuickLookThumbnailing
 
 // Sidebar item model
 enum SidebarItem: String, CaseIterable, Identifiable {
@@ -17,9 +18,9 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     case downloads = "Downloads"
     case user = "User" // Will be replaced with actual username
     case trash = "Trash"
-    
+
     var id: String { rawValue }
-    
+
     // Get the actual display name (user gets the real username)
     var displayName: String {
         if self == .user {
@@ -27,7 +28,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         }
         return self.rawValue
     }
-    
+
     var icon: String {
         switch self {
         case .recents: return "clock.fill"
@@ -39,7 +40,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         case .trash: return "trash.fill"
         }
     }
-    
+
     var path: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         switch self {
@@ -65,106 +66,93 @@ struct ContentView: View {
     @State private var searchTask: Task<Void, Never>? = nil
     @State private var selectedFileIds: Set<String> = []  // Multi-select
     @State private var selectedSidebarItem: SidebarItem = .recents
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sortOrder = [KeyPathComparator(\SearchResult.dateValue, order: .reverse)]
-    
+
     // File operation state
     @State private var showRenameSheet = false
     @State private var renameText = ""
     @State private var showMovePanel = false
-    
+
     // AI state
     @State private var showAIBar = false
     @State private var aiPrefilledPlan: AIActionPlan?
-    
+
+    // NL detection
+    @State private var isNLQuery: Bool = false
+
+    // Transient toast (undo result, AI errors, etc.)
+    @State private var toastMessage: String? = nil
+    @State private var toastIsError: Bool = false
+
     // Drill-in navigation (open folder = show only its contents; Back pops)
     @State private var navigationPathStack: [String] = []
-    
+
     /// The folder path we're currently viewing (drilled-in path or sidebar selection).
     private var effectiveCurrentPath: String? {
         if let last = navigationPathStack.last { return last }
         return selectedSidebarItem == .recents ? nil : selectedSidebarItem.path
     }
-    
+
     /// Expand/collapse folders in the main file list (arrow = expand inline).
     @State private var loadedFolderContents: [String: [SearchResult]] = [:]
     /// Path we just loaded so the outline view can reload that item.
     @State private var lastExpandedPath: String? = nil
 
-    var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            // --- SIDEBAR (flat Favorites / Locations) ---
-            List(selection: $selectedSidebarItem) {
-                Section("Favorites") {
-                    ForEach([SidebarItem.recents, .desktop, .documents, .downloads], id: \.self) { item in
-                        Label(item.displayName, systemImage: item.icon)
-                            .tag(item)
-                            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                                handleDrop(providers: providers, to: item)
-                            }
-                    }
-                }
-                Section("Locations") {
-                    ForEach([SidebarItem.user, .applications, .trash], id: \.self) { item in
-                        Label(item.displayName, systemImage: item.icon)
-                            .tag(item)
-                            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                                handleDrop(providers: providers, to: item)
-                            }
-                    }
-                }
-            }
-            .listStyle(.sidebar)
-            .frame(minWidth: 180)
-            .onChange(of: selectedSidebarItem) { newItem in
-                navigationPathStack = []
-                loadedFolderContents.removeAll()
-                loadFolder(newItem)
-            }
-        } detail: {
-            // --- MAIN CONTENT AREA ---
-            VStack(spacing: 0) {
-                // Back button when drilled into a subfolder
-                if !navigationPathStack.isEmpty {
-                    HStack(spacing: 8) {
-                        Button(action: goBack) {
-                            Image(systemName: "chevron.left")
-                            Text("Back")
-                        }
-                        .buttonStyle(.plain)
-                        Text((navigationPathStack.last as NSString?)?.lastPathComponent ?? "")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-                    Divider()
-                }
-                
-                // Search Bar
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundColor(.gray)
-                        .font(.title2)
-                    
-                    TextField("Search...", text: $query)
-                        .textFieldStyle(.plain)
-                        .font(.title2)
-                        .padding(.vertical, 12)
-                        .onSubmit { openSelected() }
-                        .onChange(of: query) { newValue in
-                            runSearch(for: newValue)
-                        }
-                }
-                .padding(.horizontal)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-                
-                Divider()
+    // File watcher
+    @StateObject private var fileWatcher: FileWatcher = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return FileWatcher(paths: [
+            "\(home)/Documents",
+            "\(home)/Downloads",
+            "\(home)/Desktop"
+        ])
+    }()
 
-                // --- OUTLINE VIEW (arrow = expand folder inline; double-click = go into folder) ---
+    // Status bar computed properties
+    private var selectedTotalSize: UInt64 {
+        let allFiles = results + loadedFolderContents.values.flatMap { $0 }
+        return allFiles.filter { selectedFileIds.contains($0.filePath) }
+            .reduce(0) { $0 + $1.fileSize }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // --- SIDEBAR ---
+            SidebarView(
+                selectedItem: $selectedSidebarItem,
+                onDrop: { providers, item in
+                    handleDrop(providers: providers, to: item)
+                }
+            )
+
+            // Vertical divider
+            Rectangle()
+                .fill(WarpTheme.divider)
+                .frame(width: 1)
+
+            // --- DETAIL AREA ---
+            VStack(spacing: 0) {
+                // Breadcrumb navigation
+                BreadcrumbBar(
+                    sidebarItem: selectedSidebarItem,
+                    navigationStack: navigationPathStack,
+                    onNavigateToIndex: { index in
+                        navigateToStackIndex(index)
+                    }
+                )
+
+                Rectangle().fill(WarpTheme.divider).frame(height: 1)
+
+                // Search Bar
+                SearchBarView(
+                    query: $query,
+                    isNLDetected: isNLQuery,
+                    onSubmit: { handleSearchSubmit() }
+                )
+
+                Rectangle().fill(WarpTheme.divider).frame(height: 1)
+
+                // --- OUTLINE VIEW ---
                 FileOutlineView(
                     files: sortedResults,
                     selection: $selectedFileIds,
@@ -186,7 +174,9 @@ struct ContentView: View {
                         let allShown = sortedResults + loadedFolderContents.values.flatMap { $0 }
                         let isFolder = allShown.first { $0.filePath == path }?.isFolder ?? false
                         if isFolder {
-                            navigateIntoFolder(path)
+                            withAnimation(.spring(response: 0.3)) {
+                                navigateIntoFolder(path)
+                            }
                         } else {
                             openFile(path)
                         }
@@ -200,54 +190,49 @@ struct ContentView: View {
                         }
                         .keyboardShortcut(.space, modifiers: [])
                     }
-                    
+
                     Divider()
-                    
+
                     Button("Open") {
                         for path in selectedFileIds {
                             openFile(path)
                         }
                     }
                     .keyboardShortcut(.return, modifiers: [])
-                    
+
                     // Rename (single file only)
                     if selectedFileIds.count == 1 {
                         Button("Rename...") {
-                            if let path = selectedFileIds.first,
-                               let name = URL(fileURLWithPath: path).lastPathComponent.components(separatedBy: ".").first {
+                            if let path = selectedFileIds.first {
                                 renameText = URL(fileURLWithPath: path).lastPathComponent
                                 showRenameSheet = true
                             }
                         }
                     }
-                    
+
                     Divider()
-                    
+
                     Button("Move to Trash") {
                         let paths = Array(selectedFileIds)
-                        let result = trashFiles(paths: paths)
-                        if result.success {
-                            results.removeAll { selectedFileIds.contains($0.filePath) }
-                            selectedFileIds.removeAll()
-                        }
+                        trashFilesNative(paths: paths)
                     }
                     .keyboardShortcut(.delete, modifiers: .command)
-                    
+
                     Button("Copy Path") {
                         let paths = selectedFileIds.joined(separator: "\n")
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(paths, forType: .string)
                     }
                     .keyboardShortcut("c", modifiers: .command)
-                    
+
                     if !selectedFileIds.isEmpty {
                         Button("Compress \(selectedFileIds.count) item\(selectedFileIds.count > 1 ? "s" : "")...") {
                             compressSelected()
                         }
                     }
-                    
+
                     Divider()
-                    
+
                     Button("Show in Finder") {
                         if let path = selectedFileIds.first {
                             NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
@@ -266,19 +251,55 @@ struct ContentView: View {
                 }
                 .onKeyPress(.delete) {
                     let paths = Array(selectedFileIds)
-                    let result = trashFiles(paths: paths)
-                    if result.success {
-                        results.removeAll { selectedFileIds.contains($0.filePath) }
-                        selectedFileIds.removeAll()
-                    }
+                    trashFilesNative(paths: paths)
                     return .handled
                 }
+
+                // Status Bar
+                StatusBar(
+                    fileCount: results.count,
+                    selectedCount: selectedFileIds.count,
+                    selectedSize: selectedTotalSize
+                )
             }
-            .frame(minWidth: 500)
+            .background(WarpTheme.surfacePrimary)
         }
         .frame(minWidth: 750, minHeight: 500)
+        .background(WarpTheme.background)
         .background(QuickLookHost())
         .task { loadFolder(.recents) }
+        .onAppear {
+            fileWatcher.onChange = { [self] in
+                refreshCurrentContent()
+            }
+            fileWatcher.start()
+        }
+        .onChange(of: selectedSidebarItem) { newItem in
+            withAnimation(.spring(response: 0.3)) {
+                navigationPathStack = []
+                loadedFolderContents.removeAll()
+            }
+            loadFolder(newItem)
+        }
+        .onChange(of: query) { newValue in
+            let detected = NLDetector.isNaturalLanguage(newValue)
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isNLQuery = detected
+            }
+            if !detected {
+                runSearch(for: newValue)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .undoLastBlock)) { _ in
+            handleUndo()
+        }
+        .overlay(alignment: .top) {
+            if let msg = toastMessage {
+                ToastBanner(message: msg, isError: toastIsError)
+                    .padding(.top, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
         .sheet(isPresented: $showRenameSheet) {
             RenameSheet(
                 currentName: renameText,
@@ -314,7 +335,7 @@ struct ContentView: View {
             }
         }
         .animation(.spring(response: 0.3), value: showAIBar)
-        // Cmd+K to toggle AI bar - using background button for keyboard shortcut
+        // Cmd+K to toggle AI bar
         .background(
             Button("") {
                 showAIBar.toggle()
@@ -323,19 +344,108 @@ struct ContentView: View {
             .hidden()
         )
     }
-    
+
     // Sorted results based on current sort order
     var sortedResults: [SearchResult] {
         results.sorted(using: sortOrder)
     }
-    
+
+    // MARK: - Search Submit (NL detection)
+
+    func handleSearchSubmit() {
+        if isNLQuery {
+            // Open AI bar with the query
+            showAIBar = true
+            aiPrefilledPlan = nil
+            // The AI bar will handle submission
+            Task {
+                do {
+                    let plan = try await AIService.shared.parseCommand(
+                        userQuery: query,
+                        currentFolder: effectiveCurrentPath ?? selectedSidebarItem.path,
+                        selectedFiles: Array(selectedFileIds)
+                    )
+                    await MainActor.run {
+                        aiPrefilledPlan = plan
+                    }
+                } catch {
+                    print("NL query AI error: \(error)")
+                }
+            }
+        } else {
+            openSelected()
+        }
+    }
+
+    // MARK: - Breadcrumb Navigation
+
+    func navigateToStackIndex(_ index: Int) {
+        if index < 0 {
+            // Navigate to sidebar root
+            withAnimation(.spring(response: 0.3)) {
+                navigationPathStack = []
+                loadedFolderContents.removeAll()
+            }
+            refreshCurrentContent()
+        } else if index < navigationPathStack.count - 1 {
+            // Navigate to intermediate path
+            let targetPath = navigationPathStack[index]
+            withAnimation(.spring(response: 0.3)) {
+                navigationPathStack = Array(navigationPathStack.prefix(index + 1))
+                loadedFolderContents.removeAll()
+            }
+            loadFolderContents(path: targetPath)
+        }
+    }
+
+    // MARK: - Native Trash
+
+    func trashFilesNative(paths: [String]) {
+        // Delegated to the Rust core so the action is recorded as a block —
+        // that's what makes Cmd+Z work afterwards. We lose Finder's native
+        // "Put Back" xattr, but in-app undo is more discoverable.
+        let result = trashFiles(paths: paths)
+        if result.affectedCount > 0 {
+            results.removeAll { paths.contains($0.filePath) }
+            selectedFileIds.removeAll()
+        }
+        if !result.success {
+            showToast(result.message, isError: true)
+        }
+    }
+
+    // MARK: - Undo + toast
+
+    private func handleUndo() {
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { undoLastBlock() }.value
+            await MainActor.run {
+                showToast(result.message, isError: !result.success)
+                if result.success { refreshCurrentContent() }
+            }
+        }
+    }
+
+    private func showToast(_ message: String, isError: Bool) {
+        withAnimation(.easeOut(duration: 0.15)) {
+            toastMessage = message
+            toastIsError = isError
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await MainActor.run {
+                withAnimation(.easeIn(duration: 0.2)) { toastMessage = nil }
+            }
+        }
+    }
+
     // --- ACTIONS ---
-    
+
     func executeAIPlan(_ plan: AIActionPlan, userQuery: String) {
         // Handle search: run search, then re-call AI with results so it can return moveFiles/trash/etc.
         if plan.action == .search {
             let searchQuery = plan.searchQuery ?? userQuery
-            print("🔍 AI searching for: \(searchQuery)")
+            print("AI searching for: \(searchQuery)")
             self.query = searchQuery
             Task {
                 let searchResults = await runSearchAndGetResults(for: searchQuery)
@@ -351,12 +461,7 @@ struct ContentView: View {
                         recentSearchResults: searchResults
                     )
                     await MainActor.run {
-                        if newPlan.action == .search {
-                            // Still no files found; show the plan so user sees the message
-                            aiPrefilledPlan = newPlan
-                        } else {
-                            aiPrefilledPlan = newPlan
-                        }
+                        aiPrefilledPlan = newPlan
                     }
                 } catch {
                     await MainActor.run {
@@ -365,57 +470,50 @@ struct ContentView: View {
                             sourcePaths: nil,
                             destination: nil,
                             searchQuery: nil,
-                            explanation: "Search completed but couldn’t interpret next step: \(error.localizedDescription)"
+                            explanation: "Search completed but couldn't interpret next step: \(error.localizedDescription)"
                         )
                     }
                 }
             }
             return
         }
-        
+
         // For file operations, we need source paths
         guard let paths = plan.sourcePaths, !paths.isEmpty else {
-            print("⚠️ AI returned no files to act on: \(plan.explanation)")
+            print("AI returned no files to act on: \(plan.explanation)")
             return
         }
-        
+
         switch plan.action {
         case .moveFiles:
             if let dest = plan.destination {
                 let result = moveFiles(sourcePaths: paths, destination: dest)
                 if result.success {
-                    print("✅ AI moved \(paths.count) files to \(dest)")
+                    showToast("Moved \(result.affectedCount) item(s)", isError: false)
                     refreshCurrentContent()
                 } else {
-                    print("❌ Move failed: \(result.message)")
+                    showToast(result.message, isError: true)
                 }
             }
         case .trashFiles:
-            let result = trashFiles(paths: paths)
-            if result.success {
-                print("✅ AI trashed \(paths.count) files")
-                results.removeAll { paths.contains($0.filePath) }
-                selectedFileIds.removeAll()
-            } else {
-                print("❌ Trash failed: \(result.message)")
-            }
+            trashFilesNative(paths: paths)
         case .compressFiles:
             let firstPath = paths[0] as NSString
             let parentDir = firstPath.deletingLastPathComponent
             let archivePath = "\(parentDir)/AI_Archive_\(Int(Date().timeIntervalSince1970)).zip"
-            
+
             let result = compressFiles(paths: paths, archivePath: archivePath)
             if result.success {
-                print("✅ AI compressed \(paths.count) files to \(archivePath)")
+                showToast("Archived \(result.affectedCount) item(s)", isError: false)
                 refreshCurrentContent()
             } else {
-                print("❌ Compress failed: \(result.message)")
+                showToast(result.message, isError: true)
             }
         case .search, .unknown:
-            print("⚠️ Unhandled action: \(plan.action)")
+            print("Unhandled action: \(plan.action)")
         }
     }
-    
+
     func loadFolder(_ item: SidebarItem) {
         query = ""
         if item == .recents {
@@ -424,7 +522,7 @@ struct ContentView: View {
         }
         loadFolderContents(path: item.path, showHidden: item == .trash)
     }
-    
+
     /// Load a folder's contents into the main area (used for sidebar selection and drill-in).
     func loadFolderContents(path: String, showHidden: Bool = false) {
         loadedFolderContents.removeAll()
@@ -438,24 +536,26 @@ struct ContentView: View {
             }
         }
     }
-    
+
     /// Push a subfolder and show only its contents (Back will pop).
     func navigateIntoFolder(_ path: String) {
         navigationPathStack.append(path)
         loadFolderContents(path: path)
     }
-    
+
     /// Pop the drill-in stack and show the previous folder (or sidebar root).
     func goBack() {
         guard !navigationPathStack.isEmpty else { return }
-        navigationPathStack.removeLast()
+        withAnimation(.spring(response: 0.3)) {
+            navigationPathStack.removeLast()
+        }
         if let path = navigationPathStack.last {
             loadFolderContents(path: path)
         } else {
             refreshCurrentContent()
         }
     }
-    
+
     /// Reload current view (after move/compress etc.).
     func refreshCurrentContent() {
         query = ""
@@ -466,14 +566,14 @@ struct ContentView: View {
             loadRecents()
         }
     }
-    
+
     func loadRecents() {
         // INSTANT: Load cached data first for immediate display
         Task {
             let cachedFiles = await Task.detached(priority: .userInitiated) {
                 return loadCachedIndex()
             }.value
-            
+
             await MainActor.run {
                 if self.query.isEmpty && !cachedFiles.isEmpty {
                     // Filter to last 7 days and show immediately
@@ -486,12 +586,12 @@ struct ContentView: View {
                     self.selectedFileIds = self.results.first.map { [$0.filePath] } ?? []
                 }
             }
-            
+
             // BACKGROUND: Rebuild index for fresh data
             let freshFiles = await Task.detached(priority: .background) {
                 return rebuildIndex()
             }.value
-            
+
             await MainActor.run {
                 if self.query.isEmpty && self.selectedSidebarItem == .recents {
                     let weekAgo = Date().timeIntervalSince1970 - (60 * 60 * 24 * 7)
@@ -505,29 +605,28 @@ struct ContentView: View {
             }
         }
     }
-    
+
     func loadDirectoryContents(path: String, showHidden: Bool = false) -> [SearchResult] {
         var items: [SearchResult] = []
         let fileManager = FileManager.default
-        
+
         do {
             let contents = try fileManager.contentsOfDirectory(atPath: path)
             for name in contents {
                 // Skip hidden files unless showHidden is true
                 if !showHidden && name.hasPrefix(".") { continue }
-                
+
                 let fullPath = (path as NSString).appendingPathComponent(name)
                 var isDir: ObjCBool = false
-                
+
                 if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir) {
                     let attrs = try? fileManager.attributesOfItem(atPath: fullPath)
                     let size = (attrs?[.size] as? UInt64) ?? 0
-                    
+
                     // Get all three date types
                     let modDate = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
                     let createDate = (attrs?[.creationDate] as? Date) ?? Date.distantPast
-                    // Access time requires lower-level API, use mod date as fallback
-                    
+
                     // Find the most recent date
                     let (bestDate, dateKind): (Date, String) = {
                         if createDate > modDate {
@@ -535,10 +634,10 @@ struct ContentView: View {
                         }
                         return (modDate, "Modified")
                     }()
-                    
+
                     let dateValue = Int64(bestDate.timeIntervalSince1970)
                     let fileKind = getFileKind(path: fullPath, isFolder: isDir.boolValue)
-                    
+
                     items.append(SearchResult(
                         fileName: name,
                         filePath: fullPath,
@@ -555,16 +654,16 @@ struct ContentView: View {
         } catch {
             print("Error loading directory: \(error)")
         }
-        
+
         // Sort by date (most recent first)
         items.sort { $0.dateValue > $1.dateValue }
-        
+
         return items
     }
-    
+
     func getFileKind(path: String, isFolder: Bool) -> String {
         if isFolder { return "Folder" }
-        
+
         let ext = (path as NSString).pathExtension.lowercased()
         switch ext {
         case "pdf": return "PDF Document"
@@ -593,11 +692,11 @@ struct ContentView: View {
         default: return ext.isEmpty ? "Document" : "\(ext.uppercased()) File"
         }
     }
-    
+
     func formatRelativeDate(_ timestamp: Int64) -> String {
         let now = Int64(Date().timeIntervalSince1970)
         let diff = now - timestamp
-        
+
         if diff < 60 { return "Just now" }
         if diff < 3600 { return "\(diff / 60)m ago" }
         if diff < 86400 { return "\(diff / 3600)h ago" }
@@ -609,12 +708,12 @@ struct ContentView: View {
 
     func runSearch(for text: String) {
         searchTask?.cancel()
-        
+
         if text.isEmpty {
             refreshCurrentContent()
             return
         }
-        
+
         searchTask = Task {
             let newResults = await runSearchAndGetResults(for: text)
             await MainActor.run {
@@ -623,7 +722,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     /// Runs search and returns results (used by AI flow so we can pass results back to Claude).
     func runSearchAndGetResults(for text: String) async -> [SearchResult] {
         guard !text.isEmpty else { return [] }
@@ -633,13 +732,15 @@ struct ContentView: View {
             searchFiles(query: text)
         }.value
     }
-    
+
     func openSelected() {
         let path = selectedFileIds.first ?? results.first?.filePath
         guard let path = path else { return }
         let isFolder = results.first { $0.filePath == path }?.isFolder ?? false
         if isFolder {
-            navigateIntoFolder(path)
+            withAnimation(.spring(response: 0.3)) {
+                navigateIntoFolder(path)
+            }
         } else {
             openFile(path)
         }
@@ -649,14 +750,14 @@ struct ContentView: View {
         let url = URL(fileURLWithPath: path)
         NSWorkspace.shared.open(url)
     }
-    
+
     func formattedDate(_ timestamp: Int64) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return formatter.localizedString(for: date, relativeTo: Date())
     }
-    
+
     func compressSelected() {
         guard let firstPath = selectedFileIds.first else { return }
         let parentDir = URL(fileURLWithPath: firstPath).deletingLastPathComponent().path
@@ -664,24 +765,23 @@ struct ContentView: View {
             ? URL(fileURLWithPath: firstPath).deletingPathExtension().lastPathComponent + ".zip"
             : "Archive.zip"
         let archivePath = (parentDir as NSString).appendingPathComponent(archiveName)
-        
+
         let paths = Array(selectedFileIds)
         let result = compressFiles(paths: paths, archivePath: archivePath)
-        
+
         if result.success {
-            // Refresh to show the new archive
             refreshCurrentContent()
         }
     }
-    
+
     // Handle dropping files onto sidebar items
     func handleDrop(providers: [NSItemProvider], to item: SidebarItem) -> Bool {
         // Can't drop onto Recents
         guard item != .recents else { return false }
-        
+
         var droppedPaths: [String] = []
         let group = DispatchGroup()
-        
+
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier("public.file-url") {
                 group.enter()
@@ -694,17 +794,12 @@ struct ContentView: View {
                 }
             }
         }
-        
+
         group.notify(queue: .main) {
             guard !droppedPaths.isEmpty else { return }
-            
+
             if item == .trash {
-                // Move to trash
-                let result = trashFiles(paths: droppedPaths)
-                if result.success {
-                    self.results.removeAll { droppedPaths.contains($0.filePath) }
-                    self.selectedFileIds.removeAll()
-                }
+                trashFilesNative(paths: droppedPaths)
             } else {
                 // Move to folder
                 let destination = item.path
@@ -715,12 +810,43 @@ struct ContentView: View {
                 }
             }
         }
-        
+
         return true
     }
 }
 
 // --- HELPERS ---
+
+/// Floating banner used for transient feedback: undo results, AI errors,
+/// permission rejections from the Rust safety layer.
+private struct ToastBanner: View {
+    let message: String
+    let isError: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isError ? "exclamationmark.triangle.fill" : "arrow.uturn.backward.circle.fill")
+                .foregroundColor(isError ? WarpTheme.warning : WarpTheme.accent)
+            Text(message)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(WarpTheme.textPrimary)
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(WarpTheme.surfacePrimary)
+                .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isError ? WarpTheme.warning.opacity(0.4) : WarpTheme.divider, lineWidth: 1)
+        )
+        .frame(maxWidth: 480)
+        .accessibilityIdentifier("toastBanner")
+    }
+}
 
 struct VisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
@@ -744,38 +870,37 @@ struct VisualEffectView: NSViewRepresentable {
 
 class QuickLookController: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     static let shared = QuickLookController()
-    
+
     var previewURL: URL?
-    
+
     func togglePreview(for path: String?) {
-        guard let path = path else { 
+        guard let path = path else {
             print("Quick Look: No file path provided")
-            return 
+            return
         }
         previewURL = URL(fileURLWithPath: path)
-        
-        guard let panel = QLPreviewPanel.shared() else { 
+
+        guard let panel = QLPreviewPanel.shared() else {
             print("Quick Look: Could not get panel")
-            return 
+            return
         }
-        
+
         if panel.isVisible {
             panel.orderOut(nil)
         } else {
-            // Set data source BEFORE showing
             panel.dataSource = self
             panel.delegate = self
             panel.reloadData()
             panel.makeKeyAndOrderFront(nil)
         }
     }
-    
+
     // MARK: - QLPreviewPanelDataSource
-    
+
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
         return previewURL != nil ? 1 : 0
     }
-    
+
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
         guard let url = previewURL else { return nil }
         return PreviewItem(url: url)
@@ -785,30 +910,29 @@ class QuickLookController: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDel
 // QLPreviewItem wrapper (must be NSObject subclass)
 class PreviewItem: NSObject, QLPreviewItem {
     let url: URL
-    
+
     init(url: URL) {
         self.url = url
         super.init()
     }
-    
+
     var previewItemURL: URL? { url }
 }
 
 // NSView that accepts Quick Look panel
 class QuickLookHostView: NSView {
     override var acceptsFirstResponder: Bool { true }
-    
+
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
         return true
     }
-    
+
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = QuickLookController.shared
         panel.delegate = QuickLookController.shared
     }
-    
+
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        // Clean up if needed
     }
 }
 
@@ -817,7 +941,7 @@ struct QuickLookHost: NSViewRepresentable {
     func makeNSView(context: Context) -> QuickLookHostView {
         return QuickLookHostView()
     }
-    
+
     func updateNSView(_ nsView: QuickLookHostView, context: Context) {}
 }
 
@@ -826,30 +950,54 @@ struct RenameSheet: View {
     @State var currentName: String
     let onRename: (String) -> Void
     let onCancel: () -> Void
-    
+
     var body: some View {
         VStack(spacing: 16) {
             Text("Rename")
                 .font(.headline)
-            
+                .foregroundColor(WarpTheme.textPrimary)
+
             TextField("Name", text: $currentName)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 300)
-            
+
             HStack {
                 Button("Cancel") {
                     onCancel()
                 }
                 .keyboardShortcut(.escape)
-                
+
                 Button("Rename") {
                     onRename(currentName)
                 }
                 .keyboardShortcut(.return)
                 .buttonStyle(.borderedProminent)
+                .tint(Color(WarpTheme.accent))
             }
         }
         .padding(24)
+        .background(WarpTheme.surfacePrimary)
+    }
+}
+
+// MARK: - Custom Table Row View (dark theme, rounded selection)
+
+class WarpTableRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        let insetRect = bounds.insetBy(dx: 4, dy: 1)
+        let path = NSBezierPath(roundedRect: insetRect, xRadius: 6, yRadius: 6)
+        WarpTheme.nsSurfaceSelected.setFill()
+        path.fill()
+    }
+
+    override var isEmphasized: Bool {
+        get { false }
+        set { }
+    }
+
+    override var interiorBackgroundStyle: NSView.BackgroundStyle {
+        return .normal
     }
 }
 
@@ -862,39 +1010,42 @@ struct FileOutlineView: NSViewRepresentable {
     @Binding var lastExpandedPath: String?
     let onFolderExpanded: (String) -> Void
     let onDoubleClick: (String) -> Void
-    
+
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         let outlineView = NSOutlineView()
-        
+
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
-        
+        scrollView.scrollerStyle = .overlay
+        scrollView.drawsBackground = false
+
         outlineView.style = .inset
-        outlineView.usesAlternatingRowBackgroundColors = true
+        outlineView.usesAlternatingRowBackgroundColors = false
         outlineView.allowsMultipleSelection = true
-        outlineView.rowHeight = 24
-        
+        outlineView.rowHeight = WarpTheme.fileRowHeight
+        outlineView.backgroundColor = WarpTheme.nsSurfacePrimary
+
         let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
         nameColumn.title = "Name"
         nameColumn.width = 300
         nameColumn.minWidth = 200
         outlineView.addTableColumn(nameColumn)
-        
+
         let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
         sizeColumn.title = "Size"
         sizeColumn.width = 80
         sizeColumn.minWidth = 60
         outlineView.addTableColumn(sizeColumn)
-        
+
         let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
         dateColumn.title = "Date"
         dateColumn.width = 120
         dateColumn.minWidth = 80
         outlineView.addTableColumn(dateColumn)
-        
+
         outlineView.outlineTableColumn = nameColumn
         outlineView.delegate = context.coordinator
         outlineView.dataSource = context.coordinator
@@ -902,32 +1053,36 @@ struct FileOutlineView: NSViewRepresentable {
         outlineView.doubleAction = #selector(Coordinator.outlineViewDoubleClick(_:))
         outlineView.setDraggingSourceOperationMask(.every, forLocal: false)
         outlineView.registerForDraggedTypes([.fileURL])
-        
+
+        // Style header
+        outlineView.headerView?.wantsLayer = true
+        outlineView.headerView?.layer?.backgroundColor = WarpTheme.nsSurfacePrimary.cgColor
+
         context.coordinator.outlineView = outlineView
         return scrollView
     }
-    
+
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let outlineView = scrollView.documentView as? NSOutlineView else { return }
-        
+
         let rootChanged = context.coordinator.files.map(\.filePath) != files.map(\.filePath)
         context.coordinator.files = files
         context.coordinator.loadedFolderContents = loadedFolderContents
         context.coordinator.selection = selection
         context.coordinator.onFolderExpanded = onFolderExpanded
         context.coordinator.onDoubleClick = onDoubleClick
-        
+
         if rootChanged {
             outlineView.reloadData()
         }
-        
+
         // If we just loaded a folder's contents, reload that item so children appear and keep it expanded
         if let path = lastExpandedPath {
             outlineView.reloadItem(path, reloadChildren: true)
             outlineView.expandItem(path)
             lastExpandedPath = nil
         }
-        
+
         // Sync selection by path
         var indexSet = IndexSet()
         for i in 0..<outlineView.numberOfRows {
@@ -939,7 +1094,7 @@ struct FileOutlineView: NSViewRepresentable {
             outlineView.selectRowIndexes(indexSet, byExtendingSelection: false)
         }
     }
-    
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             files: files,
@@ -950,7 +1105,7 @@ struct FileOutlineView: NSViewRepresentable {
             onSelectionChange: { selection = $0 }
         )
     }
-    
+
     class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         var files: [SearchResult]
         var loadedFolderContents: [String: [SearchResult]]
@@ -960,7 +1115,12 @@ struct FileOutlineView: NSViewRepresentable {
         var onSelectionChange: (Set<String>) -> Void
         weak var outlineView: NSOutlineView?
         var iconCache: [String: NSImage] = [:]
-        
+        var thumbnailCache: [String: NSImage] = [:]
+
+        private static let thumbnailTypes: Set<String> = [
+            "jpg", "jpeg", "png", "gif", "heic", "pdf", "mp4", "mov", "psd"
+        ]
+
         init(files: [SearchResult], loadedFolderContents: [String: [SearchResult]], selection: Set<String>, onFolderExpanded: @escaping (String) -> Void, onDoubleClick: @escaping (String) -> Void, onSelectionChange: @escaping (Set<String>) -> Void) {
             self.files = files
             self.loadedFolderContents = loadedFolderContents
@@ -969,13 +1129,13 @@ struct FileOutlineView: NSViewRepresentable {
             self.onDoubleClick = onDoubleClick
             self.onSelectionChange = onSelectionChange
         }
-        
+
         func searchResult(forPath path: String) -> SearchResult? {
             files.first { $0.filePath == path } ?? loadedFolderContents.values.flatMap { $0 }.first { $0.filePath == path }
         }
-        
+
         // MARK: - NSOutlineViewDataSource
-        
+
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
             if item == nil {
                 return files.count
@@ -984,7 +1144,7 @@ struct FileOutlineView: NSViewRepresentable {
             guard let result = searchResult(forPath: path), result.isFolder else { return 0 }
             return loadedFolderContents[path]?.count ?? 0
         }
-        
+
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
             if item == nil {
                 return files[index].filePath
@@ -994,25 +1154,30 @@ struct FileOutlineView: NSViewRepresentable {
             }
             return children[index].filePath
         }
-        
+
         func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
             guard let path = item as? String else { return false }
             return searchResult(forPath: path)?.isFolder ?? false
         }
-        
+
+        // MARK: - Row View (custom selection)
+
+        func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+            return WarpTableRowView()
+        }
+
         // MARK: - NSOutlineViewDelegate (expand = load children)
-        
-        /// Called when user clicks the disclosure arrow; we get the item (path) directly and trigger load.
+
         func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
             guard let path = item as? String else { return false }
             onFolderExpanded(path)
             return true
         }
-        
+
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
             guard let path = item as? String, let file = searchResult(forPath: path) else { return nil }
             let columnId = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("")
-            
+
             var cellView = outlineView.makeView(withIdentifier: columnId, owner: self) as? NSTableCellView
             if cellView == nil {
                 cellView = NSTableCellView()
@@ -1020,16 +1185,21 @@ struct FileOutlineView: NSViewRepresentable {
                 if columnId.rawValue == "name" {
                     let stack = NSStackView()
                     stack.orientation = .horizontal
-                    stack.spacing = 6
+                    stack.spacing = 8
                     let img = NSImageView()
                     img.imageScaling = .scaleProportionallyUpOrDown
                     img.setContentHuggingPriority(.required, for: .horizontal)
                     img.translatesAutoresizingMaskIntoConstraints = false
-                    NSLayoutConstraint.activate([img.widthAnchor.constraint(equalToConstant: 16), img.heightAnchor.constraint(equalToConstant: 16)])
+                    NSLayoutConstraint.activate([
+                        img.widthAnchor.constraint(equalToConstant: WarpTheme.iconSize),
+                        img.heightAnchor.constraint(equalToConstant: WarpTheme.iconSize)
+                    ])
                     let txt = NSTextField()
                     txt.isBordered = false
                     txt.drawsBackground = false
                     txt.lineBreakMode = .byTruncatingTail
+                    txt.textColor = WarpTheme.nsTextPrimary
+                    txt.font = NSFont.systemFont(ofSize: 13)
                     stack.addArrangedSubview(img)
                     stack.addArrangedSubview(txt)
                     cellView?.addSubview(stack)
@@ -1045,7 +1215,8 @@ struct FileOutlineView: NSViewRepresentable {
                     let txt = NSTextField()
                     txt.isBordered = false
                     txt.drawsBackground = false
-                    txt.textColor = .secondaryLabelColor
+                    txt.textColor = WarpTheme.nsTextSecondary
+                    txt.font = NSFont.systemFont(ofSize: 12)
                     cellView?.addSubview(txt)
                     txt.translatesAutoresizingMaskIntoConstraints = false
                     NSLayoutConstraint.activate([
@@ -1056,36 +1227,86 @@ struct FileOutlineView: NSViewRepresentable {
                     cellView?.textField = txt
                 }
             }
-            
+
             if columnId.rawValue == "name" {
-                if let cached = iconCache[path] {
-                    cellView?.imageView?.image = cached
-                } else {
-                    cellView?.imageView?.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil)
-                    DispatchQueue.global(qos: .userInitiated).async { [weak self, weak cellView] in
-                        let icon = NSWorkspace.shared.icon(forFile: path)
-                        DispatchQueue.main.async {
-                            self?.iconCache[path] = icon
-                            cellView?.imageView?.image = icon
-                        }
-                    }
-                }
+                loadIcon(for: path, into: cellView)
                 cellView?.textField?.stringValue = file.fileName
+                cellView?.textField?.textColor = WarpTheme.nsTextPrimary
             } else if columnId.rawValue == "size" {
                 cellView?.textField?.stringValue = formatFileSize(file.fileSize)
+                cellView?.textField?.textColor = WarpTheme.nsTextSecondary
             } else if columnId.rawValue == "date" {
                 cellView?.textField?.stringValue = file.prettyDate
+                cellView?.textField?.textColor = WarpTheme.nsTextSecondary
             }
             return cellView
         }
-        
+
+        // MARK: - Icon & Thumbnail Loading
+
+        private func loadIcon(for path: String, into cellView: NSTableCellView?) {
+            // Check thumbnail cache first
+            if let thumb = thumbnailCache[path] {
+                cellView?.imageView?.image = thumb
+                return
+            }
+            // Check icon cache
+            if let cached = iconCache[path] {
+                cellView?.imageView?.image = cached
+                return
+            }
+
+            // Placeholder
+            cellView?.imageView?.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil)
+
+            // Check if this file type supports thumbnails
+            let ext = (path as NSString).pathExtension.lowercased()
+            if Coordinator.thumbnailTypes.contains(ext) {
+                loadThumbnail(for: path, into: cellView)
+            } else {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self, weak cellView] in
+                    let icon = NSWorkspace.shared.icon(forFile: path)
+                    DispatchQueue.main.async {
+                        self?.iconCache[path] = icon
+                        cellView?.imageView?.image = icon
+                    }
+                }
+            }
+        }
+
+        private func loadThumbnail(for path: String, into cellView: NSTableCellView?) {
+            let url = URL(fileURLWithPath: path)
+            let size = CGSize(width: WarpTheme.iconSize * 2, height: WarpTheme.iconSize * 2)
+            let request = QLThumbnailGenerator.Request(
+                fileAt: url,
+                size: size,
+                scale: NSScreen.main?.backingScaleFactor ?? 2.0,
+                representationTypes: .thumbnail
+            )
+
+            QLThumbnailGenerator.shared.generateRepresentations(for: request) { [weak self, weak cellView] thumbnail, _, error in
+                DispatchQueue.main.async {
+                    if let cgImage = thumbnail?.cgImage {
+                        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: WarpTheme.iconSize, height: WarpTheme.iconSize))
+                        self?.thumbnailCache[path] = nsImage
+                        cellView?.imageView?.image = nsImage
+                    } else {
+                        // Fall back to workspace icon
+                        let icon = NSWorkspace.shared.icon(forFile: path)
+                        self?.iconCache[path] = icon
+                        cellView?.imageView?.image = icon
+                    }
+                }
+            }
+        }
+
         func formatFileSize(_ bytes: UInt64) -> String {
             if bytes < 1024 { return "\(bytes) B" }
             let kb = Double(bytes) / 1024
             if kb < 1024 { return String(format: "%.1f KB", kb) }
             return String(format: "%.1f MB", kb / 1024)
         }
-        
+
         func outlineViewSelectionDidChange(_ notification: Notification) {
             guard let ov = notification.object as? NSOutlineView else { return }
             var newSelection = Set<String>()
@@ -1096,13 +1317,13 @@ struct FileOutlineView: NSViewRepresentable {
             }
             onSelectionChange(newSelection)
         }
-        
+
         @objc func outlineViewDoubleClick(_ sender: NSOutlineView) {
             let row = sender.clickedRow
             guard row >= 0, let item = sender.item(atRow: row) as? String else { return }
             onDoubleClick(item)
         }
-        
+
         func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
             guard let item = outlineView.item(atRow: row) as? String else { return nil }
             return NSURL(fileURLWithPath: item)
@@ -1117,76 +1338,69 @@ struct FileTableView: NSViewRepresentable {
     @Binding var selection: Set<String>
     let onDoubleClick: (String) -> Void
     let onContextMenu: (Set<String>) -> Void
-    
+
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         let tableView = NSTableView()
-        
-        // Configure scroll view
+
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
-        
-        // Configure table view
+        scrollView.scrollerStyle = .overlay
+        scrollView.drawsBackground = false
+
         tableView.style = .inset
-        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.usesAlternatingRowBackgroundColors = false
         tableView.allowsMultipleSelection = true
         tableView.allowsColumnReordering = false
-        tableView.rowHeight = 24
-        
-        // Create columns
+        tableView.rowHeight = WarpTheme.fileRowHeight
+        tableView.backgroundColor = WarpTheme.nsSurfacePrimary
+
         let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
         nameColumn.title = "Name"
         nameColumn.width = 300
         nameColumn.minWidth = 200
         tableView.addTableColumn(nameColumn)
-        
+
         let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
         sizeColumn.title = "Size"
         sizeColumn.width = 80
         sizeColumn.minWidth = 60
         tableView.addTableColumn(sizeColumn)
-        
+
         let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
         dateColumn.title = "Date"
         dateColumn.width = 120
         dateColumn.minWidth = 80
         tableView.addTableColumn(dateColumn)
-        
-        // Set up delegate and data source
+
         tableView.delegate = context.coordinator
         tableView.dataSource = context.coordinator
-        
-        // CRITICAL: Set double-click action
         tableView.target = context.coordinator
         tableView.doubleAction = #selector(Coordinator.tableViewDoubleClick(_:))
-        
-        // Enable drag and drop (use .every for move/copy/delete support)
         tableView.setDraggingSourceOperationMask(.every, forLocal: false)
         tableView.registerForDraggedTypes([.fileURL])
-        
+
         context.coordinator.tableView = tableView
-        
+
         return scrollView
     }
-    
+
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let tableView = scrollView.documentView as? NSTableView else { return }
-        
+
         let filesChanged = context.coordinator.files.count != files.count ||
             !zip(context.coordinator.files, files).allSatisfy { $0.filePath == $1.filePath }
-        
+
         context.coordinator.files = files
         context.coordinator.selection = selection
         context.coordinator.onDoubleClick = onDoubleClick
-        
-        // Only reload if files actually changed (not on selection change)
+
         if filesChanged {
             tableView.reloadData()
         }
-        
-        // Sync selection from SwiftUI to NSTableView (without triggering delegate)
+
         let currentSelection = tableView.selectedRowIndexes
         var newIndexes = IndexSet()
         for (index, file) in files.enumerated() {
@@ -1194,12 +1408,12 @@ struct FileTableView: NSViewRepresentable {
                 newIndexes.insert(index)
             }
         }
-        
+
         if currentSelection != newIndexes {
             tableView.selectRowIndexes(newIndexes, byExtendingSelection: false)
         }
     }
-    
+
     func makeCoordinator() -> Coordinator {
         Coordinator(files: files, selection: selection, onDoubleClick: onDoubleClick, onSelectionChange: { newSelection in
             DispatchQueue.main.async {
@@ -1207,62 +1421,62 @@ struct FileTableView: NSViewRepresentable {
             }
         })
     }
-    
+
     class Coordinator: NSObject, NSTableViewDelegate, NSTableViewDataSource {
         var files: [SearchResult]
         var selection: Set<String>
         var onDoubleClick: (String) -> Void
         var onSelectionChange: (Set<String>) -> Void
         weak var tableView: NSTableView?
-        var iconCache: [String: NSImage] = [:]  // Cache icons to avoid repeated disk access
-        
+        var iconCache: [String: NSImage] = [:]
+
         init(files: [SearchResult], selection: Set<String>, onDoubleClick: @escaping (String) -> Void, onSelectionChange: @escaping (Set<String>) -> Void) {
             self.files = files
             self.selection = selection
             self.onDoubleClick = onDoubleClick
             self.onSelectionChange = onSelectionChange
         }
-        
+
         func numberOfRows(in tableView: NSTableView) -> Int {
             return files.count
         }
-        
+
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard row < files.count else { return nil }
             let file = files[row]
             let columnId = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("")
-            
-            // 1. TRY TO RECYCLE AN EXISTING CELL
+
             var cellView = tableView.makeView(withIdentifier: columnId, owner: self) as? NSTableCellView
-            
-            // 2. IF NO RECYCLABLE CELL EXISTS, CREATE ONE
+
             if cellView == nil {
                 cellView = NSTableCellView()
                 cellView?.identifier = columnId
-                
+
                 if columnId.rawValue == "name" {
                     let stack = NSStackView()
                     stack.orientation = .horizontal
-                    stack.spacing = 6
-                    
+                    stack.spacing = 8
+
                     let img = NSImageView()
                     img.imageScaling = .scaleProportionallyUpOrDown
                     img.setContentHuggingPriority(.required, for: .horizontal)
                     img.translatesAutoresizingMaskIntoConstraints = false
                     NSLayoutConstraint.activate([
-                        img.widthAnchor.constraint(equalToConstant: 16),
-                        img.heightAnchor.constraint(equalToConstant: 16)
+                        img.widthAnchor.constraint(equalToConstant: WarpTheme.iconSize),
+                        img.heightAnchor.constraint(equalToConstant: WarpTheme.iconSize)
                     ])
-                    
+
                     let txt = NSTextField()
                     txt.isBordered = false
                     txt.drawsBackground = false
                     txt.lineBreakMode = .byTruncatingTail
-                    
+                    txt.textColor = WarpTheme.nsTextPrimary
+                    txt.font = NSFont.systemFont(ofSize: 13)
+
                     stack.addArrangedSubview(img)
                     stack.addArrangedSubview(txt)
                     cellView?.addSubview(stack)
-                    
+
                     stack.translatesAutoresizingMaskIntoConstraints = false
                     NSLayoutConstraint.activate([
                         stack.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
@@ -1272,13 +1486,13 @@ struct FileTableView: NSViewRepresentable {
                     cellView?.imageView = img
                     cellView?.textField = txt
                 } else {
-                    // Simple text columns (Size, Date)
                     let txt = NSTextField()
                     txt.isBordered = false
                     txt.drawsBackground = false
-                    txt.textColor = .secondaryLabelColor
+                    txt.textColor = WarpTheme.nsTextSecondary
+                    txt.font = NSFont.systemFont(ofSize: 12)
                     cellView?.addSubview(txt)
-                    
+
                     txt.translatesAutoresizingMaskIntoConstraints = false
                     NSLayoutConstraint.activate([
                         txt.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
@@ -1288,18 +1502,13 @@ struct FileTableView: NSViewRepresentable {
                     cellView?.textField = txt
                 }
             }
-            
-            // 3. POPULATE DATA (runs for both new and recycled cells)
+
             if columnId.rawValue == "name" {
-                // Async icon loading with cache
                 let filePath = file.filePath
                 if let cachedIcon = iconCache[filePath] {
                     cellView?.imageView?.image = cachedIcon
                 } else {
-                    // Set placeholder first
                     cellView?.imageView?.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil)
-                    
-                    // Load async
                     DispatchQueue.global(qos: .userInitiated).async { [weak cellView] in
                         let icon = NSWorkspace.shared.icon(forFile: filePath)
                         DispatchQueue.main.async {
@@ -1309,17 +1518,18 @@ struct FileTableView: NSViewRepresentable {
                     }
                 }
                 cellView?.textField?.stringValue = file.fileName
+                cellView?.textField?.textColor = WarpTheme.nsTextPrimary
             } else if columnId.rawValue == "size" {
                 cellView?.textField?.stringValue = formatFileSize(file.fileSize)
+                cellView?.textField?.textColor = WarpTheme.nsTextSecondary
             } else if columnId.rawValue == "date" {
-                // Use pre-formatted date from Rust (no formatter on main thread!)
                 cellView?.textField?.stringValue = file.prettyDate
+                cellView?.textField?.textColor = WarpTheme.nsTextSecondary
             }
-            
+
             return cellView
         }
-        
-        // Helper to format file size
+
         func formatFileSize(_ bytes: UInt64) -> String {
             if bytes < 1024 { return "\(bytes) B" }
             let kb = Double(bytes) / 1024
@@ -1329,7 +1539,7 @@ struct FileTableView: NSViewRepresentable {
             let gb = mb / 1024
             return String(format: "%.1f GB", gb)
         }
-        
+
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard let tableView = notification.object as? NSTableView else { return }
             var newSelection = Set<String>()
@@ -1340,25 +1550,23 @@ struct FileTableView: NSViewRepresentable {
             }
             onSelectionChange(newSelection)
         }
-        
+
         @objc func tableViewDoubleClick(_ sender: NSTableView) {
             let clickedRow = sender.clickedRow
             guard clickedRow >= 0 && clickedRow < files.count else { return }
             let file = files[clickedRow]
             onDoubleClick(file.filePath)
         }
-        
+
         // MARK: - Drag and Drop Support
-        
+
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
             guard row < files.count else { return nil }
             let file = files[row]
             return NSURL(fileURLWithPath: file.filePath)
         }
-        
+
         func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
-            // Drag all selected rows if the dragged row is in selection
-            // Otherwise just drag the single row
         }
     }
 }
