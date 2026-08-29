@@ -47,8 +47,16 @@ impl PathRejection {
     }
 }
 
+/// $HOME, symlink-resolved where possible.
+///
+/// Resolution matters because `check_path` re-applies the policy to a
+/// canonicalized path: if HOME itself sits behind a symlink, an unresolved
+/// value here would fail every `starts_with(home)` test against that
+/// canonical path and silently skip the sensitive-subtree checks. Falls back
+/// to the raw value when the directory doesn't exist.
 fn home_dir() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/".to_string()))
+    let raw = PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+    std::fs::canonicalize(&raw).unwrap_or(raw)
 }
 
 fn app_data_dir() -> PathBuf {
@@ -63,8 +71,23 @@ fn system_prefixes() -> [&'static str; 9] {
 
 /// Sensitive paths under $HOME that we refuse to touch even though they
 /// live in the home tree. Stored as suffix-relative-to-home strings.
-fn sensitive_home_suffixes() -> [&'static str; 6] {
-    [".ssh", ".aws", ".gnupg", ".config", "Library/Keychains", "Library/Cookies"]
+///
+/// LaunchAgents/LaunchDaemons are here for a different reason than the rest:
+/// they aren't secrets to read, they're code to run. Dropping a plist into
+/// either one buys an attacker execution at next login, so an AI-planned
+/// "move these files there" must never be reachable.
+fn sensitive_home_suffixes() -> [&'static str; 9] {
+    [
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".config",
+        "Library/Keychains",
+        "Library/Cookies",
+        "Library/LaunchAgents",
+        "Library/LaunchDaemons",
+        "Library/Preferences",
+    ]
 }
 
 /// Returns the path with `.` / `..` components resolved against `base`,
@@ -85,16 +108,10 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// Core path policy check. Used for both sources and destination *parents*.
-pub fn check_path(raw: &str) -> Result<PathBuf, PathRejection> {
-    if raw.is_empty() {
-        return Err(PathRejection::Empty);
-    }
-    let p = Path::new(raw);
-    if !p.is_absolute() {
-        return Err(PathRejection::NotAbsolute);
-    }
-    let normalized = lexical_normalize(p);
+/// The string-level policy, applied to an already-normalized absolute path.
+/// Split out from `check_path` so it can be run twice: once on the path as
+/// written, and once on the symlink-resolved target.
+fn check_policy(normalized: &Path) -> Result<(), PathRejection> {
     if normalized.as_os_str().is_empty() || normalized == Path::new("/") {
         return Err(PathRejection::Root);
     }
@@ -104,8 +121,14 @@ pub fn check_path(raw: &str) -> Result<PathBuf, PathRejection> {
     // User-writable tmp areas are carve-outs from the system_prefixes
     // reject list. macOS hands out `/var/folders/...` as the app tempdir;
     // the system-dir check would otherwise eat it because `/var` is listed.
-    let in_tmp = norm_str.starts_with("/tmp/") || norm_str == "/tmp"
-        || norm_str.starts_with("/var/folders/");
+    // The `/private/...` spellings matter because `/tmp` and `/var` are
+    // themselves symlinks into `/private`, so that is what resolution returns.
+    let in_tmp = norm_str.starts_with("/tmp/")
+        || norm_str == "/tmp"
+        || norm_str.starts_with("/var/folders/")
+        || norm_str.starts_with("/private/tmp/")
+        || norm_str == "/private/tmp"
+        || norm_str.starts_with("/private/var/folders/");
 
     // System directories are off-limits — except the tmp carve-outs above.
     if !in_tmp {
@@ -151,6 +174,59 @@ pub fn check_path(raw: &str) -> Result<PathBuf, PathRejection> {
         }
     }
 
+    Ok(())
+}
+
+/// Resolve `path` through any symlinks, including ones in its parent chain.
+///
+/// `fs::canonicalize` needs the path to exist, which destinations often don't,
+/// so we walk up to the deepest ancestor that does exist, resolve that, and
+/// re-attach the remaining components. Returns None only if nothing in the
+/// chain resolves.
+fn resolve_through_symlinks(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&cursor) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        let name = cursor.file_name()?.to_os_string();
+        tail.push(name);
+        cursor = cursor.parent()?.to_path_buf();
+    }
+}
+
+/// Core path policy check. Used for both sources and destination *parents*.
+///
+/// The policy is applied twice: to the path as written, and to what it
+/// actually resolves to. A symlink is otherwise a complete bypass — every
+/// string check here passes for `~/Documents/invoice.pdf`, but if that is a
+/// link to `~/.ssh/id_rsa` then `fs::copy` and `File::open` read straight
+/// through it. Archives are allowed to carry symlinks, so an attacker only
+/// needs the user to unzip something and then say "compress my documents".
+pub fn check_path(raw: &str) -> Result<PathBuf, PathRejection> {
+    if raw.is_empty() {
+        return Err(PathRejection::Empty);
+    }
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return Err(PathRejection::NotAbsolute);
+    }
+    let normalized = lexical_normalize(p);
+    check_policy(&normalized)?;
+
+    if let Some(resolved) = resolve_through_symlinks(&normalized) {
+        if resolved != normalized {
+            check_policy(&resolved)?;
+        }
+    }
+
+    // Callers keep operating on the path as written — resolution is used to
+    // judge the request, not to rewrite it.
     Ok(normalized)
 }
 
