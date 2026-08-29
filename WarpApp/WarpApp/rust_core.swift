@@ -419,6 +419,22 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
     typealias FfiType = Int32
     typealias SwiftType = Int32
@@ -586,6 +602,62 @@ public func FfiConverterTypeFileOpResult_lift(_ buf: RustBuffer) throws -> FileO
 #endif
 public func FfiConverterTypeFileOpResult_lower(_ value: FileOpResult) -> RustBuffer {
     return FfiConverterTypeFileOpResult.lower(value)
+}
+
+
+/**
+ * What one incremental pass changed. Returned so the UI can skip a refresh
+ * when nothing actually moved.
+ */
+public struct IndexUpdate: Equatable, Hashable {
+    public var upserted: UInt32
+    public var removed: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(upserted: UInt32, removed: UInt32) {
+        self.upserted = upserted
+        self.removed = removed
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension IndexUpdate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIndexUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IndexUpdate {
+        return
+            try IndexUpdate(
+                upserted: FfiConverterUInt32.read(from: &buf), 
+                removed: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IndexUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.upserted, into: &buf)
+        FfiConverterUInt32.write(value.removed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexUpdate_lift(_ buf: RustBuffer) throws -> IndexUpdate {
+    return try FfiConverterTypeIndexUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexUpdate_lower(_ value: IndexUpdate) -> RustBuffer {
+    return FfiConverterTypeIndexUpdate.lower(value)
 }
 
 
@@ -776,6 +848,39 @@ public func getRecentFiles() -> [SearchResult]  {
 })
 }
 /**
+ * Reconcile the index against a specific set of paths, as reported by
+ * FSEvents. This is the steady-state path: it touches only what changed
+ * instead of re-walking every scan root.
+ *
+ * For each path:
+ * - gone from disk → delete its row, plus every row beneath it (a deleted
+ * or renamed directory takes its whole subtree with it)
+ * - a directory → re-walk that subtree and tombstone-prune it, which also
+ * covers the coalesced `MustScanSubDirs` events FSEvents sends under load
+ * - a file → upsert if indexable, otherwise make sure it isn't lingering
+ *
+ * Paths outside the scan roots are ignored, so the caller can forward the
+ * raw event list without pre-filtering.
+ */
+public func indexPaths(paths: [String]) -> IndexUpdate  {
+    return try!  FfiConverterTypeIndexUpdate_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_index_paths(
+        FfiConverterSequenceString.lower(paths),$0
+    )
+})
+}
+/**
+ * Last FSEvents id we have already folded into the index, or 0 if none.
+ * The app passes this back as the stream's `sinceWhen` so a relaunch replays
+ * only what changed while it was closed instead of re-walking everything.
+ */
+public func lastEventId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_last_event_id($0
+    )
+})
+}
+/**
  * Load the persisted index for instant startup.
  * Returns rows ordered by best-date desc; capped to 50k to keep the FFI
  * crossing cheap. If the DB isn't openable yet (first launch race), returns [].
@@ -798,7 +903,20 @@ public func moveFiles(sourcePaths: [String], destination: String) -> FileOpResul
 })
 }
 /**
- * Rebuild the index and save to cache (call in background)
+ * True when the app should run a full `rebuild_index` instead of relying on
+ * the incremental stream: nothing indexed yet, or the last full scan is old
+ * enough that we can't trust having seen every event since.
+ */
+public func needsFullRescan() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_needs_full_rescan($0
+    )
+})
+}
+/**
+ * Full rescan of every scan root. Expensive: this walks the whole tree, so
+ * the app should call it on first run or when the incremental event stream
+ * has gone stale — `index_paths` handles the steady state.
  */
 public func rebuildIndex() -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
@@ -823,6 +941,15 @@ public func searchFiles(query: String) -> [SearchResult]  {
         FfiConverterString.lower(query),$0
     )
 })
+}
+/**
+ * Persist the FSEvents id reached after a successful `index_paths` pass.
+ */
+public func setLastEventId(id: UInt64)  {try! rustCall() {
+    uniffi_rust_core_fn_func_set_last_event_id(
+        FfiConverterUInt64.lower(id),$0
+    )
+}
 }
 /**
  * Move files to Trash
@@ -879,19 +1006,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rust_core_checksum_func_index_paths() != 32092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_last_event_id() != 15009) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_load_cached_index() != 38582) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_move_files() != 44044) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_rebuild_index() != 17457) {
+    if (uniffi_rust_core_checksum_func_needs_full_rescan() != 6768) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_rebuild_index() != 60778) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_rename_file() != 42280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_search_files() != 43504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_set_last_event_id() != 5445) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_trash_files() != 51150) {

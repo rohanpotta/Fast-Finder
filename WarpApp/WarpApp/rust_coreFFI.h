@@ -275,6 +275,17 @@ RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustCallStatus *_Nonnull ou
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_INDEX_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_INDEX_PATHS
+RustBuffer uniffi_rust_core_fn_func_index_paths(RustBuffer paths, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LAST_EVENT_ID
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LAST_EVENT_ID
+uint64_t uniffi_rust_core_fn_func_last_event_id(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
 RustBuffer uniffi_rust_core_fn_func_load_cached_index(RustCallStatus *_Nonnull out_status
@@ -284,6 +295,12 @@ RustBuffer uniffi_rust_core_fn_func_load_cached_index(RustCallStatus *_Nonnull o
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_MOVE_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_MOVE_FILES
 RustBuffer uniffi_rust_core_fn_func_move_files(RustBuffer source_paths, RustBuffer destination, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_NEEDS_FULL_RESCAN
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_NEEDS_FULL_RESCAN
+int8_t uniffi_rust_core_fn_func_needs_full_rescan(RustCallStatus *_Nonnull out_status
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
@@ -300,6 +317,11 @@ RustBuffer uniffi_rust_core_fn_func_rename_file(RustBuffer path, RustBuffer new_
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_LAST_EVENT_ID
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_LAST_EVENT_ID
+void uniffi_rust_core_fn_func_set_last_event_id(uint64_t id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_TRASH_FILES
@@ -609,6 +631,18 @@ uint16_t uniffi_rust_core_checksum_func_get_recent_files(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_INDEX_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_INDEX_PATHS
+uint16_t uniffi_rust_core_checksum_func_index_paths(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LAST_EVENT_ID
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LAST_EVENT_ID
+uint16_t uniffi_rust_core_checksum_func_last_event_id(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LOAD_CACHED_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_LOAD_CACHED_INDEX
 uint16_t uniffi_rust_core_checksum_func_load_cached_index(void
@@ -618,6 +652,12 @@ uint16_t uniffi_rust_core_checksum_func_load_cached_index(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_MOVE_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_MOVE_FILES
 uint16_t uniffi_rust_core_checksum_func_move_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_NEEDS_FULL_RESCAN
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_NEEDS_FULL_RESCAN
+uint16_t uniffi_rust_core_checksum_func_needs_full_rescan(void
     
 );
 #endif
@@ -636,6 +676,12 @@ uint16_t uniffi_rust_core_checksum_func_rename_file(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 uint16_t uniffi_rust_core_checksum_func_search_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SET_LAST_EVENT_ID
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SET_LAST_EVENT_ID
+uint16_t uniffi_rust_core_checksum_func_set_last_event_id(void
     
 );
 #endif
