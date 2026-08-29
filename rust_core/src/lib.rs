@@ -9,6 +9,11 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Deserialize, Serialize};
 
+mod blocks;
+mod db;
+mod safety;
+mod schema;
+
 uniffi::setup_scaffolding!();
 
 #[derive(uniffi::Record, Clone, Serialize, Deserialize)]
