@@ -16,25 +16,22 @@ struct AIActionPlan: Decodable, Equatable {
     let destination: String?
     let searchQuery: String?
     let explanation: String
-    
+
     enum CodingKeys: String, CodingKey {
         case action, explanation, destination
         case sourcePaths = "source_paths"
         case searchQuery = "search_query"
-        case query  // Claude sometimes returns "query" instead
     }
-    
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         action = try container.decode(AIAction.self, forKey: .action)
         sourcePaths = try container.decodeIfPresent([String].self, forKey: .sourcePaths)
         destination = try container.decodeIfPresent(String.self, forKey: .destination)
-        explanation = try container.decode(String.self, forKey: .explanation)
-        // Accept either "search_query" or "query"
         searchQuery = try container.decodeIfPresent(String.self, forKey: .searchQuery)
-            ?? container.decodeIfPresent(String.self, forKey: .query)
+        explanation = try container.decode(String.self, forKey: .explanation)
     }
-    
+
     init(action: AIAction, sourcePaths: [String]?, destination: String?, searchQuery: String?, explanation: String) {
         self.action = action
         self.sourcePaths = sourcePaths
@@ -44,14 +41,35 @@ struct AIActionPlan: Decodable, Equatable {
     }
 }
 
-// MARK: - AI Service (Claude Edition)
+// MARK: - AI Service (Claude tool use)
 
 actor AIService {
     static let shared = AIService()
-    
-    /// API key: read from Config.xcconfig (copied into app bundle; keep that file gitignored). Fallback: UserDefaults.
+
+    /// Anthropic Sonnet — current cheap+fast model for structured tool calls.
+    /// If you change this, also re-test the tool-use response parser.
+    private let model = "claude-sonnet-4-6"
+
+    /// Run on app launch (from WarpAppApp.init). Moves any legacy plaintext
+    /// key out of UserDefaults into the Keychain and then deletes the
+    /// UserDefaults copy. Idempotent: safe to call every launch.
+    nonisolated static func migrateAPIKeyOnLaunch() {
+        let defaults = UserDefaults.standard
+        if let legacy = defaults.string(forKey: "claude_api_key"), !legacy.isEmpty {
+            if KeychainHelper.load() == nil {
+                _ = KeychainHelper.save(apiKey: legacy)
+            }
+            defaults.removeObject(forKey: "claude_api_key")
+        }
+    }
+
+    /// API key: Keychain first, then Config.xcconfig (bundled placeholder for
+    /// dev builds). UserDefaults is no longer consulted — it was plaintext on
+    /// disk in `~/Library/Preferences/...plist`.
     private var apiKey: String? {
-        // 1. Config.xcconfig in the app bundle (added to Copy Bundle Resources)
+        if let keychainKey = KeychainHelper.load(), !keychainKey.isEmpty {
+            return keychainKey
+        }
         if let configPath = Bundle.main.path(forResource: "Config", ofType: "xcconfig"),
            let contents = try? String(contentsOfFile: configPath, encoding: .utf8) {
             let key = parseAPIKey(from: contents)
@@ -59,13 +77,9 @@ actor AIService {
                 return key
             }
         }
-        // 2. UserDefaults (e.g. if set in-app later)
-        if let stored = UserDefaults.standard.string(forKey: "claude_api_key"), !stored.isEmpty {
-            return stored
-        }
         return nil
     }
-    
+
     private func parseAPIKey(from xcconfigContents: String) -> String? {
         for line in xcconfigContents.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -77,9 +91,9 @@ actor AIService {
         }
         return nil
     }
-    
+
     // MARK: - Public API
-    
+
     func parseCommand(
         userQuery: String,
         currentFolder: String,
@@ -89,185 +103,204 @@ actor AIService {
         guard let apiKey = apiKey, !apiKey.isEmpty else {
             throw AIError.noApiKey
         }
-        
+
+        // Build BOTH the prompt context AND the allow-list of paths the model
+        // is permitted to act on. The allow-list is what saves us from prompt
+        // injection via malicious filenames — even if a file is named
+        // `; rm -rf ~`, the worst it can do is fail to be re-quoted later;
+        // it can't smuggle /etc/passwd into source_paths because that string
+        // is not in the allow-list.
+        let allowedPaths: Set<String>
         let fileContext: String
         let contextKind: String
+
         if !recentSearchResults.isEmpty {
             contextKind = "SEARCH_RESULTS"
+            allowedPaths = Set(recentSearchResults.map { $0.filePath })
             fileContext = recentSearchResults.map { "\($0.filePath) (\($0.fileName))" }.joined(separator: "\n")
         } else if selectedFiles.isEmpty {
             contextKind = "CURRENT_FOLDER"
-            fileContext = getFileListingForAi(path: currentFolder)
+            let listing = getFileListingForAi(path: currentFolder)
+            allowedPaths = Self.extractPathsFromListing(listing)
+            fileContext = listing
         } else {
             contextKind = "SELECTED"
+            allowedPaths = Set(selectedFiles)
             fileContext = selectedFiles.joined(separator: ", ")
         }
-        
+
         let prompt = buildPrompt(
             userQuery: userQuery,
             currentFolder: currentFolder,
             fileContext: fileContext,
             contextKind: contextKind
         )
-        
-        let response = try await callClaudeAPI(prompt: prompt, apiKey: apiKey)
-        return try parseResponse(response)
+
+        let plan = try await callClaudeWithTools(prompt: prompt, apiKey: apiKey)
+
+        // Prompt-injection defense: every source_path must be one we showed
+        // the model. Destinations are NOT validated here — they can be new
+        // folders the user asked for. The Rust `safety` layer enforces the
+        // policy for destinations.
+        if let sources = plan.sourcePaths, !sources.isEmpty {
+            let unknown = sources.filter { !allowedPaths.contains($0) }
+            if !unknown.isEmpty {
+                throw AIError.injectionDetected(unknown)
+            }
+        }
+
+        return plan
     }
-    
+
     func setApiKey(_ key: String) {
-        UserDefaults.standard.set(key, forKey: "claude_api_key")
+        // Keychain-only. We never write to UserDefaults — see
+        // migrateAPIKeyOnLaunch for the migration path.
+        _ = KeychainHelper.save(apiKey: key)
     }
-    
+
     func hasApiKey() -> Bool {
         guard let key = apiKey else { return false }
         return !key.isEmpty
     }
-    
+
     // MARK: - Private Helpers
-    
-    private func buildPrompt(userQuery: String, currentFolder: String, fileContext: String, contextKind: String = "CURRENT_FOLDER") -> String {
-        if contextKind == "SEARCH_RESULTS" {
-            return buildPromptWithSearchResults(
-                userQuery: userQuery,
-                currentFolder: currentFolder,
-                fileContext: fileContext
-            )
+
+    /// Extract `"path": "..."` values from the JSON returned by
+    /// `getFileListingForAi`. Tolerates missing/malformed JSON by returning
+    /// an empty set (the caller will then reject any source_paths the model
+    /// returns, which is the correct safe default).
+    private static func extractPathsFromListing(_ listing: String) -> Set<String> {
+        guard let data = listing.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
         }
-        return buildPromptCurrentFolder(
-            userQuery: userQuery,
-            currentFolder: currentFolder,
-            fileContext: fileContext
-        )
+        return Set(arr.compactMap { $0["path"] as? String })
     }
-    
-    /// Prompt when we already ran a search and are passing the result list. Model must NOT return search.
-    private func buildPromptWithSearchResults(userQuery: String, currentFolder: String, fileContext: String) -> String {
-        """
-        You are a file operation assistant. Return ONLY a JSON object.
-        
-        CRITICAL: The app already ran a search. The list below contains ALL search results (one path per line).
-        
-        DETERMINISM: If the user said "all", "every", or a plural ("screenshots", "pdfs"), you MUST include EVERY matching path in source_paths. One file = only when the user clearly asked for a single item. "Move all screenshots" = every file that is a screenshot (name contains "screenshot" or is an image type).
-        
-        ALLOWED ACTIONS (only these): moveFiles, trashFiles, compressFiles.
-        NOT ALLOWED: search (already done).
-        
-        SEARCH RESULTS (use these exact paths in source_paths):
-        \(fileContext)
-        
-        USER REQUEST: "\(userQuery)"
-        
-        INSTRUCTIONS:
-        1. Copy the EXACT paths from the list for every file that matches the user's intent. For "all screenshots" = every path that looks like a screenshot (name or type).
-        2. source_paths = array of every matching path; do not omit any.
-        3. For moveFiles, set destination to a full folder path. If user said "a folder named X", use \(currentFolder)/X.
-        
-        Return JSON only:
-        {"action":"moveFiles","source_paths":["/path/to/file1.png","/path/to/file2.png",...],"destination":"/path/to/folder","explanation":"Moving N files to folder"}
-        """
-    }
-    
-    /// Prompt when we're showing current folder listing; search is allowed if no match.
-    private func buildPromptCurrentFolder(userQuery: String, currentFolder: String, fileContext: String) -> String {
-        """
-        You are a file operation assistant. Return ONLY a JSON object.
-        
+
+    private func buildPrompt(userQuery: String, currentFolder: String, fileContext: String, contextKind: String) -> String {
+        if contextKind == "SEARCH_RESULTS" {
+            return """
+            The app already ran a search. The list below contains the full result set
+            (one path per line). When the user said "all", "every", or used a plural
+            ("screenshots", "pdfs"), include EVERY matching path in source_paths.
+
+            ALLOWED ACTIONS: moveFiles, trashFiles, compressFiles. (search is forbidden — already ran.)
+
+            SEARCH RESULTS:
+            \(fileContext)
+
+            USER REQUEST: "\(userQuery)"
+
+            For moveFiles, set destination to a full folder path. If the user said
+            "a folder named X", use \(currentFolder)/X.
+            """
+        }
+        return """
         AVAILABLE ACTIONS:
-        - moveFiles: Move files to a destination folder
-        - trashFiles: Move files to Trash
-        - compressFiles: Create a ZIP archive
-        - search: ONLY if no file in the list below matches the user's request (then we will search the system)
-        
+        - moveFiles: move files to a destination folder
+        - trashFiles: send to Trash
+        - compressFiles: build a ZIP archive
+        - search: ONLY if no file in the list below matches the user's intent
+
         CURRENT FOLDER: \(currentFolder)
-        
-        FILES IN THIS FOLDER (each object has "path", "name", "kind" — use the exact "path" for source_paths):
+
+        FILES IN THIS FOLDER (JSON with "path", "name", "kind"; use exact paths):
         \(fileContext)
-        
+
         USER REQUEST: "\(userQuery)"
-        
-        CRITICAL RULES FOR DETERMINISM:
-        1. When the user says "all", "every", or a plural ("screenshots", "pdfs", "the images"), you MUST include EVERY matching file in source_paths. Do not include only one.
-        2. Matching: "screenshots" = any file whose name contains "screenshot" or "Screenshot", or kind is image (PNG, JPEG, etc.). "PDFs" = kind PDF or name contains ".pdf". When in doubt, include any file that reasonably matches.
-        3. source_paths must be the exact "path" values from the list above (copy them verbatim).
-        4. If zero files in the list match, return action "search" with a "query" string so we can search the system.
-        5. For moveFiles, destination = full folder path; if user said "a folder named X", use \(currentFolder)/X.
-        
-        Return JSON only (no markdown):
-        {"action":"moveFiles","source_paths":["/exact/path/1","/exact/path/2",...],"destination":"/path/to/folder","explanation":"Moving N files to folder"}
-        or {"action":"search","query":"search terms","explanation":"..."}
+
+        When the user says "all", "every", or a plural ("screenshots", "pdfs"),
+        include EVERY matching file in source_paths. Match generously:
+        "screenshots" = any file whose name contains "screenshot" or whose kind is
+        an image; "PDFs" = kind PDF or name ending .pdf. For moveFiles, set
+        destination to a full folder path. If the user said "a folder named X",
+        use \(currentFolder)/X. If nothing in the list matches, return search with
+        a search_query.
         """
     }
-    
-    private func callClaudeAPI(prompt: String, apiKey: String) async throws -> String {
+
+    private func callClaudeWithTools(prompt: String, apiKey: String) async throws -> AIActionPlan {
         let url = URL(string: "https://api.anthropic.com/v1/messages")!
-        
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        
-        let body: [String: Any] = [
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1024,
-            "messages": [
-                ["role": "user", "content": prompt]
+
+        // Structured output via tool use: we force the model to call this tool,
+        // which means the response is always a typed JSON object — no more
+        // regex-extracting `{...}` from free-form prose.
+        let toolName = "plan_file_action"
+        let toolDef: [String: Any] = [
+            "name": toolName,
+            "description": "Return the file management action plan based on the user request and provided file context.",
+            "input_schema": [
+                "type": "object",
+                "properties": [
+                    "action": [
+                        "type": "string",
+                        "enum": ["moveFiles", "trashFiles", "compressFiles", "search"],
+                        "description": "Which operation to perform."
+                    ],
+                    "source_paths": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Absolute file paths copied verbatim from the provided context. Required for moveFiles, trashFiles, compressFiles."
+                    ],
+                    "destination": [
+                        "type": "string",
+                        "description": "Absolute folder path. Required for moveFiles and the archive path for compressFiles."
+                    ],
+                    "search_query": [
+                        "type": "string",
+                        "description": "Free-text search query. Required for the search action only."
+                    ],
+                    "explanation": [
+                        "type": "string",
+                        "description": "Short human-readable summary the UI will display."
+                    ]
+                ],
+                "required": ["action", "explanation"]
             ]
         ]
-        
+
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 1024,
+            "tools": [toolDef],
+            "tool_choice": ["type": "tool", "name": toolName],
+            "messages": [["role": "user", "content": prompt]]
+        ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
+
         let (data, response) = try await URLSession.shared.data(for: request)
-        
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AIError.networkError("Invalid response")
         }
-        
         guard httpResponse.statusCode == 200 else {
             let errorText = String(data: data, encoding: .utf8) ?? "Unknown error"
             throw AIError.apiError("Status \(httpResponse.statusCode): \(errorText)")
         }
-        
-        // Parse Claude response
+
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let firstContent = content.first,
-              let text = firstContent["text"] as? String else {
-            throw AIError.parseError("Could not parse Claude response")
+              let content = json["content"] as? [[String: Any]] else {
+            throw AIError.parseError("Malformed Claude response shape")
         }
-        
-        return text
-    }
-    
-    private func parseResponse(_ response: String) throws -> AIActionPlan {
-        var jsonString = response
-        
-        print("🤖 Raw Claude response: \(response)")
-        
-        // Strip markdown code blocks
-        jsonString = jsonString.replacingOccurrences(of: "```json", with: "")
-        jsonString = jsonString.replacingOccurrences(of: "```", with: "")
-        jsonString = jsonString.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // Extract JSON between { and }
-        guard let jsonStart = jsonString.range(of: "{"),
-              let jsonEnd = jsonString.range(of: "}", options: .backwards),
-              jsonStart.lowerBound < jsonEnd.upperBound else {
-            throw AIError.parseError("No valid JSON found in response: \(response.prefix(200))")
+
+        // Find the tool_use block. The API may emit a leading thinking/text
+        // block alongside the tool_use; we tolerate any ordering.
+        guard let toolUseBlock = content.first(where: { ($0["type"] as? String) == "tool_use" }),
+              let input = toolUseBlock["input"] as? [String: Any] else {
+            throw AIError.parseError("Claude did not return a tool_use block")
         }
-        // Use half-open range to avoid index out of bounds
-        jsonString = String(jsonString[jsonStart.lowerBound..<jsonEnd.upperBound])
-        
-        print("🧹 Cleaned JSON: \(jsonString)")
-        
-        guard let data = jsonString.data(using: .utf8) else {
-            throw AIError.parseError("Could not convert response to data")
-        }
-        
+
+        // Re-encode the typed input dict and decode through Codable so the
+        // existing AIActionPlan validation logic stays in one place.
+        let inputData = try JSONSerialization.data(withJSONObject: input)
         do {
-            return try JSONDecoder().decode(AIActionPlan.self, from: data)
+            return try JSONDecoder().decode(AIActionPlan.self, from: inputData)
         } catch {
-            throw AIError.parseError("JSON decode failed: \(error.localizedDescription)\nRaw: \(jsonString.prefix(200))")
+            throw AIError.parseError("tool_use input did not match AIActionPlan: \(error.localizedDescription)")
         }
     }
 }
@@ -279,7 +312,8 @@ enum AIError: Error, LocalizedError {
     case networkError(String)
     case apiError(String)
     case parseError(String)
-    
+    case injectionDetected([String])
+
     var errorDescription: String? {
         switch self {
         case .noApiKey:
@@ -290,6 +324,10 @@ enum AIError: Error, LocalizedError {
             return "API error: \(msg)"
         case .parseError(let msg):
             return "Could not understand AI response: \(msg)"
+        case .injectionDetected(let unknown):
+            let preview = unknown.prefix(3).joined(separator: ", ")
+            let more = unknown.count > 3 ? " (+\(unknown.count - 3) more)" : ""
+            return "Refused: AI proposed paths that weren't in the shown file list — \(preview)\(more)"
         }
     }
 }

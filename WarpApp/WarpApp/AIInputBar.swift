@@ -31,14 +31,15 @@ struct AIInputBar: View {
             // Header with close button
             HStack {
                 Image(systemName: "sparkles")
-                    .foregroundColor(.purple)
+                    .foregroundColor(WarpTheme.aiAccent)
                     .font(.system(size: 16))
                 Text("AI Assistant")
                     .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(WarpTheme.textPrimary)
                 Spacer()
                 Button(action: { isPresented = false }) {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
+                        .foregroundColor(WarpTheme.textSecondary)
                         .font(.system(size: 16))
                 }
                 .buttonStyle(.plain)
@@ -57,16 +58,17 @@ struct AIInputBar: View {
                 TextField("Describe what you want to do...", text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
+                    .foregroundColor(WarpTheme.textPrimary)
                     .disabled(isProcessing)
                     .onSubmit { Task { await submitQuery() } }
-                
+
                 if isProcessing {
                     ProgressView()
                         .scaleEffect(0.7)
                 } else if !query.isEmpty && state != .planReady {
                     Button(action: { Task { await submitQuery() } }) {
                         Image(systemName: "arrow.up.circle.fill")
-                            .foregroundColor(.purple)
+                            .foregroundColor(WarpTheme.aiAccent)
                             .font(.system(size: 22))
                     }
                     .buttonStyle(.plain)
@@ -82,9 +84,17 @@ struct AIInputBar: View {
                 hintsView
             }
         }
-        .background(.ultraThinMaterial)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(WarpTheme.surfacePrimary)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(WarpTheme.divider, lineWidth: 1)
+                )
+                .shadow(color: WarpTheme.aiGlow, radius: 20, y: 8)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 14))
-        .shadow(color: .black.opacity(0.25), radius: 25, y: 12)
+        .shadow(color: .black.opacity(0.4), radius: 25, y: 12)
         .frame(width: 520)
         .onAppear { reset() }
         .onChange(of: prefilledPlan) { newValue in
@@ -105,25 +115,25 @@ struct AIInputBar: View {
             EmptyView()
             
         case .thinking:
-            statusRow(icon: "brain.head.profile", iconColor: .purple, text: "Thinking...", isAnimated: true)
-            
+            statusRow(icon: "brain.head.profile", iconColor: WarpTheme.aiAccent, text: "Thinking...", isAnimated: true)
+
         case .searching(let term):
-            statusRow(icon: "magnifyingglass", iconColor: .blue, text: "Searching for \"\(term)\"...", isAnimated: true)
-            
+            statusRow(icon: "magnifyingglass", iconColor: WarpTheme.accent, text: "Searching for \"\(term)\"...", isAnimated: true)
+
         case .planReady:
             EmptyView() // Plan shows in content area
-            
+
         case .executing:
-            statusRow(icon: "gearshape.2", iconColor: .orange, text: "Executing action...", isAnimated: true)
-            
+            statusRow(icon: "gearshape.2", iconColor: WarpTheme.warning, text: "Executing action...", isAnimated: true)
+
         case .success(let msg):
             HStack(spacing: 10) {
                 Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(.green)
+                    .foregroundColor(WarpTheme.success)
                     .font(.system(size: 18))
                 Text(msg)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.primary)
+                    .foregroundColor(WarpTheme.textPrimary)
                 Spacer()
                 Button("Done") { isPresented = false }
                     .buttonStyle(.bordered)
@@ -131,16 +141,16 @@ struct AIInputBar: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
-            .background(Color.green.opacity(0.1))
-            
+            .background(WarpTheme.success.opacity(0.1))
+
         case .error(let msg):
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
+                    .foregroundColor(WarpTheme.warning)
                     .font(.system(size: 16))
                 Text(msg)
                     .font(.system(size: 12))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(WarpTheme.textSecondary)
                     .lineLimit(2)
                 Spacer()
                 Button("Retry") {
@@ -152,7 +162,7 @@ struct AIInputBar: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
-            .background(Color.orange.opacity(0.1))
+            .background(WarpTheme.warning.opacity(0.1))
         }
     }
     
@@ -164,7 +174,7 @@ struct AIInputBar: View {
                 .symbolEffect(.pulse, options: isAnimated ? .repeating : .nonRepeating)
             Text(text)
                 .font(.system(size: 13))
-                .foregroundColor(.secondary)
+                .foregroundColor(WarpTheme.textSecondary)
             Spacer()
         }
         .padding(.horizontal, 16)
@@ -186,9 +196,10 @@ struct AIInputBar: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(titleForAction(plan.action))
                         .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(WarpTheme.textPrimary)
                     Text(plan.explanation)
                         .font(.system(size: 12))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(WarpTheme.textSecondary)
                         .lineLimit(2)
                 }
                 Spacer()
@@ -202,18 +213,18 @@ struct AIInputBar: View {
                     ForEach(paths.prefix(4), id: \.self) { path in
                         HStack(spacing: 6) {
                             Image(systemName: "doc.fill")
-                                .foregroundColor(.blue.opacity(0.7))
+                                .foregroundColor(WarpTheme.accent.opacity(0.7))
                                 .font(.system(size: 10))
                             Text((path as NSString).lastPathComponent)
                                 .font(.system(size: 11))
-                                .foregroundColor(.primary.opacity(0.8))
+                                .foregroundColor(WarpTheme.textPrimary)
                                 .lineLimit(1)
                         }
                     }
                     if paths.count > 4 {
                         Text("+\(paths.count - 4) more files")
                             .font(.system(size: 10))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(WarpTheme.textSecondary)
                     }
                 }
                 .padding(.horizontal, 46)
@@ -240,14 +251,14 @@ struct AIInputBar: View {
             if let dest = plan.destination {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.right")
-                        .foregroundColor(.secondary)
+                        .foregroundColor(WarpTheme.textSecondary)
                         .font(.system(size: 10))
                     Image(systemName: "folder.fill")
                         .foregroundColor(.blue)
                         .font(.system(size: 10))
                     Text((dest as NSString).lastPathComponent)
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(WarpTheme.textSecondary)
                 }
                 .padding(.horizontal, 46)
             }
@@ -282,7 +293,7 @@ struct AIInputBar: View {
             Divider()
             Text("Try saying:")
                 .font(.system(size: 11))
-                .foregroundColor(.secondary)
+                .foregroundColor(WarpTheme.textSecondary)
                 .padding(.horizontal, 16)
                 .padding(.top, 6)
             
@@ -299,12 +310,12 @@ struct AIInputBar: View {
     private func hintRow(icon: String, text: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
-                .foregroundColor(.secondary.opacity(0.7))
+                .foregroundColor(WarpTheme.textTertiary)
                 .frame(width: 14)
                 .font(.system(size: 11))
             Text(text)
                 .font(.system(size: 11))
-                .foregroundColor(.secondary)
+                .foregroundColor(WarpTheme.textSecondary)
         }
     }
     
@@ -380,11 +391,11 @@ struct AIInputBar: View {
     
     private func colorForAction(_ action: AIAction) -> Color {
         switch action {
-        case .moveFiles: return .blue
-        case .trashFiles: return .red
-        case .compressFiles: return .orange
-        case .search: return .purple
-        case .unknown: return .gray
+        case .moveFiles: return WarpTheme.accent
+        case .trashFiles: return WarpTheme.destructive
+        case .compressFiles: return WarpTheme.warning
+        case .search: return WarpTheme.aiAccent
+        case .unknown: return WarpTheme.textSecondary
         }
     }
     
@@ -431,5 +442,5 @@ struct AIInputBar: View {
         onExecute: { _, _ in }
     )
     .padding(40)
-    .background(Color.gray.opacity(0.3))
+    .background(WarpTheme.background)
 }
