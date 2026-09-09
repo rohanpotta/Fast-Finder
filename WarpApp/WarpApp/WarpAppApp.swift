@@ -41,4 +41,7 @@ struct WarpAppApp: App {
 
 extension Notification.Name {
     static let undoLastBlock = Notification.Name("WarpApp.undoLastBlock")
+    /// Posted when the indexed-folder list changes, so the open window can
+    /// point its file watcher at the new roots and refresh.
+    static let indexedFoldersChanged = Notification.Name("WarpApp.indexedFoldersChanged")
 }

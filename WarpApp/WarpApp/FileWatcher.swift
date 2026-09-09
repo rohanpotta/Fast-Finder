@@ -22,24 +22,30 @@ struct FileChangeBatch {
 
 class FileWatcher: ObservableObject {
     private var stream: FSEventStreamRef?
-    private let paths: [String]
+    /// Not `let`: the indexed-folder list is user-editable, so the watcher has
+    /// to be able to re-point at new roots without the app restarting.
+    private var paths: [String] = []
     var onChange: ((FileChangeBatch) -> Void)?
-
-    init(paths: [String]) {
-        self.paths = paths
-    }
 
     deinit {
         stop()
     }
 
+    /// Tear down and re-arm on a different set of roots.
+    func restart(paths: [String], sinceEventId: UInt64 = 0) {
+        stop()
+        start(paths: paths, sinceEventId: sinceEventId)
+    }
+
     /// - Parameter sinceEventId: resume point from a previous run, so a
     ///   relaunch replays what changed while the app was closed instead of
     ///   forcing a full re-walk. Pass 0 to only watch from now on.
-    func start(sinceEventId: UInt64 = 0) {
+    func start(paths: [String], sinceEventId: UInt64 = 0) {
         guard stream == nil else { return }
+        guard !paths.isEmpty else { return }
+        self.paths = paths
 
-        let cfPaths = paths as CFArray
+        let cfPaths = self.paths as CFArray
         var context = FSEventStreamContext()
         context.info = Unmanaged.passUnretained(self).toOpaque()
 

@@ -102,15 +102,9 @@ struct ContentView: View {
     /// Path we just loaded so the outline view can reload that item.
     @State private var lastExpandedPath: String? = nil
 
-    // File watcher
-    @StateObject private var fileWatcher: FileWatcher = {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return FileWatcher(paths: [
-            "\(home)/Documents",
-            "\(home)/Downloads",
-            "\(home)/Desktop"
-        ])
-    }()
+    // File watcher. Roots come from the indexed-folder setting at start time,
+    // not from a hardcoded list, so editing that setting actually takes effect.
+    @StateObject private var fileWatcher = FileWatcher()
 
     // Status bar computed properties
     private var selectedTotalSize: UInt64 {
@@ -309,6 +303,9 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .undoLastBlock)) { _ in
             handleUndo()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .indexedFoldersChanged)) { _ in
+            restartWatching()
         }
         .overlay(alignment: .top) {
             if let msg = toastMessage {
@@ -623,10 +620,24 @@ struct ContentView: View {
             }
         }
 
+        let roots = await Task.detached(priority: .utility) { getIndexedFolders() }.value
         fileWatcher.onChange = { batch in
             handleFileChanges(batch)
         }
-        fileWatcher.start(sinceEventId: resumeId)
+        fileWatcher.start(paths: roots, sinceEventId: resumeId)
+    }
+
+    /// Re-point the watcher after the indexed-folder list changes. Without this
+    /// the app would keep watching the old roots until relaunch, so edits to a
+    /// newly added folder would go unnoticed.
+    private func restartWatching() {
+        Task {
+            let roots = await Task.detached(priority: .utility) { getIndexedFolders() }.value
+            await MainActor.run {
+                fileWatcher.restart(paths: roots)
+                if query.isEmpty { refreshCurrentContent() }
+            }
+        }
     }
 
     /// Fold one FSEvents batch into the index and refresh only if it actually
