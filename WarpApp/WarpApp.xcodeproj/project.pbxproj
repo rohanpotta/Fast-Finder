@@ -27,7 +27,7 @@
 
 /* Begin PBXFileReference section */
 		EBEC4D362F132CAA00FF24D5 /* WarpApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WarpApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		EBEC4D4D2F13301400FF24D5 /* librust_core.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = librust_core.dylib; path = ../rust_core/target/debug/librust_core.dylib; sourceTree = "<group>"; };
+		EBEC4D4D2F13301400FF24D5 /* librust_core.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = librust_core.dylib; path = WarpApp/librust_core.dylib; sourceTree = "<group>"; };
 		EBEC4D512F13308800FF24D5 /* WarpApp-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "WarpApp-Bridging-Header.h"; sourceTree = "<group>"; };
 		EBEC4D522F13309900FF24D5 /* Config.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -86,6 +86,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = EBEC4D412F132CAB00FF24D5 /* Build configuration list for PBXNativeTarget "WarpApp" */;
 			buildPhases = (
+				EBEC4D9A2F13301400FF24D5 /* Build Rust core */,
 				EBEC4D322F132CAA00FF24D5 /* Sources */,
 				EBEC4D332F132CAA00FF24D5 /* Frameworks */,
 				EBEC4D342F132CAA00FF24D5 /* Resources */,
@@ -148,6 +149,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		EBEC4D9A2F13301400FF24D5 /* Build Rust core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/build-rust-core.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		EBEC4D322F132CAA00FF24D5 /* Sources */ = {
@@ -296,8 +319,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				LIBRARY_SEARCH_PATHS = (
-					"/Users/ropo/Documents/warp-fast-finder/rust_core/target/debug",
 					"$(PROJECT_DIR)/WarpApp",
 				);
 				MARKETING_VERSION = 1.0;
@@ -330,8 +353,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				LIBRARY_SEARCH_PATHS = (
-					"/Users/ropo/Documents/warp-fast-finder/rust_core/target/debug",
 					"$(PROJECT_DIR)/WarpApp",
 				);
 				MARKETING_VERSION = 1.0;

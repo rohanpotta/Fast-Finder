@@ -31,3 +31,9 @@ xcuserdata/
 # Optional: If you want to force regeneration every time, ignore this.
 # But usually, it's safe to commit it so the project opens cleanly.
 # WarpApp/WarpApp/rust_core.swift
+
+# --- Rust core dylib ---
+# Produced by WarpApp/build-rust-core.sh during the Xcode build. It was tracked
+# for a while, which meant a 5MB binary churning in history and, worse, a copy
+# that could silently disagree with the source it was built from.
+WarpApp/WarpApp/librust_core.dylib
