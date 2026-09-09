@@ -230,6 +230,52 @@ pub fn check_path(raw: &str) -> Result<PathBuf, PathRejection> {
     Ok(normalized)
 }
 
+/// Policy for a folder the user wants *indexed*, which is deliberately looser
+/// than `check_path`.
+///
+/// `check_path` governs mutations, so it refuses anything outside $HOME.
+/// Reading is a different risk: indexing an external volume or a shared
+/// directory is a legitimate thing to want from a file finder, and refusing it
+/// would be the difference between "better than Finder" and "worse". What we
+/// still refuse is the set of places that are all cost and no benefit —
+/// credentials, keychains, and the OS itself.
+pub fn check_index_root(raw: &str) -> Result<PathBuf, PathRejection> {
+    if raw.is_empty() {
+        return Err(PathRejection::Empty);
+    }
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return Err(PathRejection::NotAbsolute);
+    }
+    let normalized = lexical_normalize(p);
+    let resolved = resolve_through_symlinks(&normalized).unwrap_or_else(|| normalized.clone());
+
+    for candidate in [&normalized, &resolved] {
+        let s = candidate.to_string_lossy();
+        if candidate.as_os_str().is_empty() || *candidate == PathBuf::from("/") {
+            return Err(PathRejection::Root);
+        }
+        // The OS itself. /Users and /Volumes are intentionally absent: those
+        // are where a user's own files live.
+        for sys in ["/System", "/usr", "/bin", "/sbin", "/etc", "/dev"] {
+            if s == sys || s.starts_with(&format!("{}/", sys)) {
+                return Err(PathRejection::SystemDir);
+            }
+        }
+        if candidate.starts_with(&app_data_dir()) {
+            return Err(PathRejection::AppDataDir);
+        }
+        let home = home_dir();
+        for suffix in sensitive_home_suffixes() {
+            if candidate.starts_with(&home.join(suffix)) {
+                return Err(PathRejection::Sensitive);
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Source paths must point at things that exist; destinations can be new.
 pub fn check_sources(paths: &[String]) -> Result<Vec<PathBuf>, (usize, PathRejection)> {
     if paths.len() > MAX_BULK_PATHS {
