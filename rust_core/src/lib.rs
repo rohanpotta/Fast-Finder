@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 mod blocks;
 mod db;
+mod query;
 mod safety;
 mod schema;
 
@@ -948,37 +949,115 @@ fn build_fts_query(raw: &str) -> Option<String> {
     }
 }
 
+/// Result cap for a single search. Generous enough that a filter-only query
+/// ("every PDF") is useful rather than an arbitrary top-50 slice.
+const SEARCH_LIMIT: usize = 200;
+
+/// One parsed filter, for the UI to render as a removable chip.
+#[derive(uniffi::Record, Clone)]
+pub struct QueryChip {
+    /// Human-readable, e.g. "PDF" or "added < 7d ago".
+    pub label: String,
+    /// The original token, so the UI can strip it from the query.
+    pub token: String,
+}
+
+/// How the search bar's raw text was understood.
+#[derive(uniffi::Record, Clone)]
+pub struct ParsedQuery {
+    /// The part that goes to full-text search.
+    pub text: String,
+    pub chips: Vec<QueryChip>,
+    /// Tokens that looked like filters but couldn't be read, e.g. `added:banana`.
+    pub invalid: Vec<String>,
+}
+
+/// Parse search-bar input without running it, so the UI can show what it
+/// understood as the user types.
+#[uniffi::export]
+pub fn parse_query(raw: String) -> ParsedQuery {
+    let p = query::parse(&raw);
+    ParsedQuery {
+        text: p.text,
+        chips: p
+            .filters
+            .iter()
+            .map(|f| QueryChip { label: f.label.clone(), token: f.token.clone() })
+            .collect(),
+        invalid: p.invalid,
+    }
+}
+
+/// Search the index. `query` may mix free text with filter tokens
+/// (`report kind:pdf added:<7d`); filters alone are a valid query.
+///
+/// Everything happens in SQLite against indexed columns — no network, no model
+/// call. That's the point: `kind:pdf added:<7d` used to be expressible only as
+/// prose through the AI bar.
 #[uniffi::export]
 pub fn search_files(query: String, date_field: DateField) -> Vec<SearchResult> {
-    let Some(fts) = build_fts_query(&query) else {
+    let parsed = query::parse(&query);
+    let fts = build_fts_query(&parsed.text);
+
+    // Nothing to go on at all. Filters alone are fine; empty input is not.
+    if fts.is_none() && parsed.filters.is_empty() {
         return Vec::new();
-    };
+    }
     let Ok(conn) = db::open_default() else {
         return Vec::new();
     };
 
-    // bm25() returns negative numbers; lower = better. We invert into a
-    // positive score so the existing Swift sort-by-score-desc behavior
-    // continues to work. The selected date is the second sort key for ties.
-    let sql = format!(
-        "SELECT f.path, f.name, f.size, f.is_dir, f.file_kind,
-                {value} AS date_value,
-                {kind} AS date_kind,
-                CAST(-bm25(files_fts) * 1000 AS INTEGER) AS score
-         FROM files_fts
-         JOIN files f ON f.id = files_fts.rowid
-         WHERE files_fts MATCH ?1
-         ORDER BY score DESC, date_value DESC
-         LIMIT 50",
-        value = date_field.value_expr("f."),
-        kind = date_field.kind_expr("f."),
-    );
+    let now = blocks::now_ts();
+    let prefix = if fts.is_some() { "f." } else { "" };
+    let (mut clauses, filter_params) = query::compile(&parsed.filters, prefix, now);
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+    let sql = if let Some(fts) = fts {
+        // bm25() returns negative numbers; lower = better. Invert into a
+        // positive score so sort-by-score-desc reads naturally. The selected
+        // date breaks ties.
+        params.push(rusqlite::types::Value::Text(fts));
+        params.extend(filter_params);
+        clauses.insert(0, "files_fts MATCH ?".to_string());
+        format!(
+            "SELECT f.path, f.name, f.size, f.is_dir, f.file_kind,
+                    {value} AS date_value,
+                    {kind} AS date_kind,
+                    CAST(-bm25(files_fts) * 1000 AS INTEGER) AS score
+             FROM files_fts
+             JOIN files f ON f.id = files_fts.rowid
+             WHERE {where_clause}
+             ORDER BY score DESC, date_value DESC
+             LIMIT {limit}",
+            value = date_field.value_expr("f."),
+            kind = date_field.kind_expr("f."),
+            where_clause = clauses.join(" AND "),
+            limit = SEARCH_LIMIT,
+        )
+    } else {
+        // Filter-only: no relevance to rank by, so order by the chosen date.
+        params.extend(filter_params);
+        format!(
+            "SELECT path, name, size, is_dir, file_kind,
+                    {value} AS date_value,
+                    {kind} AS date_kind,
+                    {value} AS score
+             FROM files
+             WHERE {where_clause}
+             ORDER BY date_value DESC
+             LIMIT {limit}",
+            value = date_field.value_expr(""),
+            kind = date_field.kind_expr(""),
+            where_clause = clauses.join(" AND "),
+            limit = SEARCH_LIMIT,
+        )
+    };
+
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-
-    stmt.query_map(params![fts], map_row)
+    stmt.query_map(rusqlite::params_from_iter(params), map_row)
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
 }
@@ -2548,6 +2627,256 @@ mod tests {
         assert!(src.exists(), "source must be untouched");
     }
 
+    /// The bug this pins down: a `cargo build` inside an indexed repo emits
+    /// thousands of FSEvents under a gitignored `target/`. `index_paths` judged
+    /// them on scope alone, indexed them all, and the next full rescan removed
+    /// them again — the index swung by ~14k rows (40%) depending on which ran
+    /// last, and gitignored build output showed up in search results.
+    #[test]
+    fn test_file_events_honour_gitignore_like_the_full_scan_does() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let repo = docs.join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap(); // marks it a repo
+        fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
+        fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+        let target = repo.join("target/debug");
+        std::fs::create_dir_all(&target).unwrap();
+        let artifact = target.join("build-script-build");
+        fs::write(&artifact, "binary").unwrap();
+
+        // Baseline: the full scan already excludes the artifact.
+        rebuild_index();
+        let conn = db::open_default().unwrap();
+        let scanned: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        let artifact_rows = |c: &rusqlite::Connection| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%/target/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(artifact_rows(&conn), 0, "full scan must skip gitignored target/");
+
+        // The event the build emits. It must not be indexed.
+        let update = index_paths(vec![artifact.to_string_lossy().into_owned()]);
+        assert_eq!(
+            artifact_rows(&conn),
+            0,
+            "a gitignored build artifact must not enter the index via a file event"
+        );
+        assert_eq!(update.upserted, 0);
+
+        // The same must hold for a *directory* event. FSEvents reports
+        // directories too, and collecting one walks it — with the walk root
+        // unfiltered, so this leaked the entire ignored subtree.
+        let dir_update = index_paths(vec![target.to_string_lossy().into_owned()]);
+        assert_eq!(
+            artifact_rows(&conn),
+            0,
+            "a directory event on a gitignored folder must not index its contents"
+        );
+        assert_eq!(dir_update.upserted, 0);
+
+        // A non-ignored sibling still indexes normally — we haven't just
+        // broken incremental indexing to win the test.
+        fs::write(repo.join("lib.rs"), "pub fn x() {}").unwrap();
+        let ok = index_paths(vec![repo.join("lib.rs").to_string_lossy().into_owned()]);
+        assert_eq!(ok.upserted, 1, "ordinary files must still be indexed");
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, scanned + 1, "exactly the one new real file");
+    }
+
+    #[test]
+    fn test_directory_event_does_not_erode_the_index() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        // A tree deep enough that a subtree walk has a smaller depth budget
+        // than the full scan had.
+        let deep = docs.join("proj/a/b/c/d");
+        std::fs::create_dir_all(&deep).unwrap();
+        for (i, dir) in [
+            docs.join("proj"),
+            docs.join("proj/a"),
+            docs.join("proj/a/b"),
+            docs.join("proj/a/b/c"),
+            deep.clone(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(dir.join(format!("f{}.md", i)), "x").unwrap();
+        }
+
+        rebuild_index();
+        let conn = db::open_default().unwrap();
+        let after_scan: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert!(after_scan > 5, "sanity: the tree was indexed");
+
+        // An FSEvents directory notification for an unchanged directory must be
+        // a no-op. If the subtree walk sees less than the index holds, the
+        // diff-prune deletes the difference and files silently vanish.
+        index_paths(vec![docs.join("proj").to_string_lossy().into_owned()]);
+        let after_event: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_event, after_scan,
+            "a directory event on an unchanged tree must not remove rows"
+        );
+    }
+
+    // MARK: - filter tokens end to end
+
+    /// Seed a spread of files so filters have something to discriminate.
+    fn seed_for_filters() -> i64 {
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        let day = 86_400i64;
+        let rows: [(&str, &str, &str, i64, i64, i64); 5] = [
+            // path, name, ext, size, mtime, birthtime
+            ("/tmp/d/report.pdf",   "report.pdf",   "pdf",  2_000_000, now - day,       now - day),
+            ("/tmp/d/old.pdf",      "old.pdf",      "pdf",        500, now - day * 400, now - day * 400),
+            ("/tmp/d/photo.png",    "photo.png",    "png",  5_000_000, now - day * 2,   now - day * 2),
+            ("/tmp/d/notes.md",     "notes.md",     "md",         100, now - day * 3,   now - day * 3),
+            ("/tmp/other/report.md","report.md",    "md",         100, now - day,       now - day),
+        ];
+        for (path, name, ext, size, mtime, birth) in rows {
+            conn.execute(
+                "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+                 VALUES (?1, ?2, '/tmp/d', ?3, ?4, 0, ?5, ?6, 'x', ?5)",
+                rusqlite::params![path, name, ext, size, mtime, birth],
+            )
+            .unwrap();
+        }
+        // A folder, to prove is:folder/is:file discriminate.
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/d/archive', 'archive', '/tmp/d', NULL, 0, 1, ?1, ?1, 'Folder', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        now
+    }
+
+    fn names(results: &[SearchResult]) -> Vec<String> {
+        let mut v: Vec<String> = results.iter().map(|r| r.file_name.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_filter_only_query_needs_no_search_text() {
+        let _scope = db_scope();
+        seed_for_filters();
+        let hits = search_files("kind:pdf".to_string(), DateField::Either);
+        assert_eq!(names(&hits), vec!["old.pdf", "report.pdf"]);
+    }
+
+    #[test]
+    fn test_text_and_filter_combine() {
+        let _scope = db_scope();
+        seed_for_filters();
+        // Two files match "report"; only one is a PDF.
+        assert_eq!(
+            names(&search_files("report".to_string(), DateField::Either)).len(),
+            2
+        );
+        assert_eq!(
+            names(&search_files("report kind:pdf".to_string(), DateField::Either)),
+            vec!["report.pdf"]
+        );
+    }
+
+    #[test]
+    fn test_age_filter_excludes_old_files() {
+        let _scope = db_scope();
+        seed_for_filters();
+        // old.pdf is 400 days old, report.pdf is 1 day old.
+        assert_eq!(
+            names(&search_files("kind:pdf added:<7d".to_string(), DateField::Either)),
+            vec!["report.pdf"]
+        );
+        assert_eq!(
+            names(&search_files("kind:pdf added:>1y".to_string(), DateField::Either)),
+            vec!["old.pdf"]
+        );
+    }
+
+    #[test]
+    fn test_size_and_kind_group_filters() {
+        let _scope = db_scope();
+        seed_for_filters();
+        assert_eq!(
+            names(&search_files("size:>1mb".to_string(), DateField::Either)),
+            vec!["photo.png", "report.pdf"]
+        );
+        // kind:image expands to an extension set.
+        assert_eq!(
+            names(&search_files("kind:image".to_string(), DateField::Either)),
+            vec!["photo.png"]
+        );
+    }
+
+    #[test]
+    fn test_is_folder_and_in_path_filters() {
+        let _scope = db_scope();
+        seed_for_filters();
+        assert_eq!(
+            names(&search_files("is:folder".to_string(), DateField::Either)),
+            vec!["archive"]
+        );
+        // `in:` scopes to a path fragment.
+        assert_eq!(
+            names(&search_files("in:other".to_string(), DateField::Either)),
+            vec!["report.md"]
+        );
+    }
+
+    #[test]
+    fn test_filter_values_cannot_inject_sql() {
+        let _scope = db_scope();
+        seed_for_filters();
+        // If values were interpolated rather than bound, this would drop the
+        // table. It must simply match nothing.
+        let hits = search_files(
+            "ext:pdf'); DROP TABLE files; --".to_string(),
+            DateField::Either,
+        );
+        assert!(hits.is_empty());
+        let conn = db::open_default().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 6, "table must still be intact");
+    }
+
+    #[test]
+    fn test_empty_query_still_returns_nothing() {
+        let _scope = db_scope();
+        seed_for_filters();
+        assert!(search_files("".to_string(), DateField::Either).is_empty());
+        assert!(search_files("   ".to_string(), DateField::Either).is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_exposes_chips_and_invalid_tokens() {
+        let parsed = parse_query("report kind:pdf added:<7d added:banana".to_string());
+        assert_eq!(parsed.text, "report");
+        assert_eq!(parsed.chips.len(), 2);
+        assert_eq!(parsed.chips[0].label, "PDF");
+        assert_eq!(parsed.chips[0].token, "kind:pdf");
+        assert_eq!(parsed.invalid, vec!["added:banana".to_string()]);
+    }
+
     // MARK: - date field selection
 
     /// Two files that disagree about which date is which:
@@ -2651,3 +2980,6 @@ mod tests {
         assert_eq!(last_event_id(), 918_273_645);
     }
 }
+
+
+
