@@ -197,10 +197,30 @@ impl DateField {
 
 /// Directory depth below a scan root that we index, matching the walker's
 /// `max_depth`. Root itself is depth 0, its children depth 1.
-const MAX_SCAN_DEPTH: usize = 5;
+///
+/// Was 5, which was survivable only because the roots were three shallow
+/// folders. Now that any folder can be a root — `~` included — 5 would cut off
+/// most real project trees.
+const MAX_SCAN_DEPTH: usize = 10;
 
-/// Folders the indexer walks.
+/// Folders the indexer walks, from the `settings` table.
+///
+/// Falls back to the historical three when unset, so an existing install keeps
+/// behaving as it did until the user says otherwise.
 fn scan_roots() -> Vec<String> {
+    if let Ok(conn) = db::open_default() {
+        if let Some(json) = db::get_setting(&conn, SETTING_INDEXED_FOLDERS) {
+            if let Ok(folders) = serde_json::from_str::<Vec<String>>(&json) {
+                if !folders.is_empty() {
+                    return folders;
+                }
+            }
+        }
+    }
+    default_scan_roots()
+}
+
+fn default_scan_roots() -> Vec<String> {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
     vec![
         format!("{}/Documents", home),
@@ -209,33 +229,57 @@ fn scan_roots() -> Vec<String> {
     ]
 }
 
-fn allowed_extensions() -> &'static HashSet<&'static str> {
-    static EXTS: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    EXTS.get_or_init(|| {
+/// Directory names never worth indexing, matched anywhere beneath a root.
+///
+/// `Library` is the big one: ~920k files of application internals on a typical
+/// Mac, which Finder also hides by default. The rest are build and dependency
+/// caches. `.gitignore` already prunes most of them inside repos — this list is
+/// what catches them when they're *not* in a repo.
+///
+/// Deliberately excluded from this list: `build`, `dist`, `target`. They're
+/// plausible names for real user folders, and gitignore handles the cases that
+/// matter, so pruning them by name would cost more than it saves.
+fn excluded_dir_names() -> &'static HashSet<&'static str> {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
         [
-            "pdf", "doc", "docx", "txt", "rtf", "md", "pages", "odt",
-            "xls", "xlsx", "csv", "numbers",
-            "ppt", "pptx", "key",
-            "jpg", "jpeg", "png", "gif", "heic", "webp", "svg", "psd", "ai",
-            "mp4", "mov", "avi", "mkv", "webm",
-            "mp3", "wav", "aac", "flac", "m4a",
-            "py", "js", "ts", "rs", "swift", "java", "go", "html", "css", "json",
-            "zip", "tar", "gz", "rar", "7z", "dmg",
+            "Library",
+            "node_modules",
+            "DerivedData",
+            "Pods",
+            "__pycache__",
+            "venv",
+            ".venv",
         ]
         .into_iter()
         .collect()
     })
 }
 
-/// Extension policy, mirroring the filter inside the parallel walker:
-///   - anything with an extension must be on the allow-list (this also drops
-///     oddly-named directories like `my.backup`, same as the walker)
-///   - a file with no extension is skipped; a directory with none is kept
-fn extension_allows(path: &Path, is_dir: bool) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => allowed_extensions().contains(ext.to_lowercase().as_str()),
-        None => is_dir,
+/// Component-level policy, shared by the parallel walker and the single-path
+/// check so the full scan and the incremental updater cannot drift apart.
+/// Returns the path's depth below `root` when it is acceptable.
+///
+/// The hidden check here is not redundant with `WalkBuilder::hidden(true)`: an
+/// explicit `!` negation in a `.gitignore` (the usual way people commit a
+/// `.gitkeep` or `.env.example`) whitelists the file and overrides the walker's
+/// hidden filter. Without this backstop the full scan indexed a handful of
+/// dotfiles that `index_paths` would always refuse — the two paths disagreeing
+/// about the same file, which is the one thing this section exists to prevent.
+fn component_depth_if_allowed(path: &Path, root: &str) -> Option<usize> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut depth = 0usize;
+    for component in rel.components() {
+        depth += 1;
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with('.') {
+            return None;
+        }
+        if excluded_dir_names().contains(name.as_ref()) {
+            return None;
+        }
     }
+    Some(depth)
 }
 
 /// The scan root containing `path`, if any. Returned so callers can compute
@@ -247,32 +291,25 @@ fn scan_root_for(path: &Path) -> Option<String> {
 }
 
 /// Full eligibility check for a single path: inside a scan root, within the
-/// depth limit, not hidden, and extension-allowed.
+/// depth limit, not hidden, and not inside an excluded directory.
+///
+/// There is deliberately no longer an extension allow-list. It made anything
+/// unlisted — a `Makefile`, an `.xcodeproj`, a file with no extension at all —
+/// permanently unfindable, which is the opposite of replacing Finder.
 ///
 /// Note: the full rescan additionally honours `.gitignore` via `WalkBuilder`.
 /// We deliberately don't reimplement that for single-file events — the cost of
 /// a stray indexed row is far lower than the cost of getting ignore-file
 /// semantics subtly wrong in two places. Directory events re-walk through
 /// `WalkBuilder`, so subtrees stay exact.
-fn is_indexable(path: &Path, is_dir: bool) -> bool {
+fn is_indexable(path: &Path, _is_dir: bool) -> bool {
     let Some(root) = scan_root_for(path) else {
         return false;
     };
-    let Ok(rel) = path.strip_prefix(&root) else {
-        return false;
-    };
-    let mut depth = 0usize;
-    for component in rel.components() {
-        depth += 1;
-        let name = component.as_os_str().to_string_lossy();
-        if name.starts_with('.') {
-            return false;
-        }
+    match component_depth_if_allowed(path, &root) {
+        Some(depth) => depth <= MAX_SCAN_DEPTH,
+        None => false,
     }
-    if depth > MAX_SCAN_DEPTH {
-        return false;
-    }
-    extension_allows(path, is_dir)
 }
 
 /// Build the FFI record plus the raw (mtime, birthtime) we persist alongside it.
@@ -365,14 +402,23 @@ fn collect_subtree(root: &str, max_depth: usize) -> Vec<(SearchResult, i64, i64)
         .build_parallel();
 
     let sink = collected.clone();
+    let root_owned = root.to_string();
     walker.run(move || {
         let sink = sink.clone();
+        let root_owned = root_owned.clone();
         Box::new(move |entry_result| {
             if let Ok(entry) = entry_result {
                 let path = entry.path();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                if !extension_allows(path, is_dir) {
-                    return ignore::WalkState::Continue;
+                if component_depth_if_allowed(path, &root_owned).is_none() {
+                    // Prune the whole subtree rather than skipping entry by
+                    // entry — descending into ~/Library to reject each of its
+                    // ~920k files costs far more than not descending at all.
+                    return if is_dir {
+                        ignore::WalkState::Skip
+                    } else {
+                        ignore::WalkState::Continue
+                    };
                 }
                 if let Ok(metadata) = entry.metadata() {
                     if let Ok(mut lock) = sink.lock() {
@@ -500,8 +546,10 @@ pub fn rebuild_index() -> Vec<SearchResult> {
             let _ = tx.commit();
         }
         // Stamp the completion so the app can tell whether the incremental
-        // stream is still trustworthy on next launch.
+        // stream is still trustworthy on next launch, and record which policy
+        // these rows were collected under.
         let _ = db::set_setting(&conn, SETTING_LAST_FULL_SCAN, &now.to_string());
+        let _ = db::set_setting(&conn, SETTING_POLICY_VERSION, INDEX_POLICY_VERSION);
     }
 
     collected.into_iter().map(|(sr, _, _)| sr).collect()
@@ -512,6 +560,21 @@ pub fn rebuild_index() -> Vec<SearchResult> {
 /// Settings keys backing the incremental pipeline.
 const SETTING_LAST_FULL_SCAN: &str = "last_full_scan_at";
 const SETTING_LAST_EVENT_ID: &str = "fsevents_last_id";
+const SETTING_INDEXED_FOLDERS: &str = "indexed_folders";
+const SETTING_POLICY_VERSION: &str = "index_policy_version";
+
+/// Bump this whenever *what gets indexed* changes — the depth cap, the
+/// exclusion list, the extension policy, the default roots.
+///
+/// Without it, an upgrade leaves rows that were collected under the old rules
+/// sitting in the index until the 24h staleness window happens to expire. That
+/// bit us exactly once: dropping the extension allow-list and adding the
+/// directory exclusions left ~2.5k node_modules rows from the previous policy
+/// visible in search, because a scan had run 23 minutes earlier and
+/// `needs_full_rescan` had no way to know the rules had moved underneath it.
+/// 2: dropped the extension allow-list, added directory exclusions, depth 5→10.
+/// 3: hidden-component backstop, so a gitignore-whitelisted dotfile stays out.
+const INDEX_POLICY_VERSION: &str = "3";
 
 /// How long a full rescan stays trustworthy. Past this we assume the FSEvents
 /// stream may have dropped something and re-walk from scratch.
@@ -666,6 +729,11 @@ pub fn needs_full_rescan() -> bool {
     if count == 0 {
         return true;
     }
+    // Rows collected under a different indexing policy are not trustworthy no
+    // matter how recently they were written.
+    if db::get_setting(&conn, SETTING_POLICY_VERSION).as_deref() != Some(INDEX_POLICY_VERSION) {
+        return true;
+    }
     match db::get_setting(&conn, SETTING_LAST_FULL_SCAN).and_then(|v| v.parse::<i64>().ok()) {
         Some(last) => blocks::now_ts() - last > FULL_SCAN_MAX_AGE_SECS,
         None => true,
@@ -691,6 +759,93 @@ pub fn set_last_event_id(id: u64) {
     if let Ok(conn) = db::open_default() {
         let _ = db::set_setting(&conn, SETTING_LAST_EVENT_ID, &id.to_string());
     }
+}
+
+// ============== INDEXED FOLDERS ==============
+
+/// Folders currently indexed. This is the real list the indexer uses — the
+/// Settings UI reads it from here rather than keeping its own copy, which is
+/// how it ended up displaying three folders it had no influence over.
+#[uniffi::export]
+pub fn get_indexed_folders() -> Vec<String> {
+    scan_roots()
+}
+
+/// Outcome of changing the folder list, so the UI can report what happened
+/// instead of silently succeeding.
+#[derive(uniffi::Record, Clone)]
+pub struct FolderUpdate {
+    pub accepted: Vec<String>,
+    pub rejected: Vec<String>,
+    /// Rows dropped because they no longer sit under any indexed folder.
+    pub pruned: u32,
+}
+
+/// Replace the indexed-folder list.
+///
+/// Rejects anything that isn't an existing directory or that `safety` refuses
+/// as a read root, and reports it rather than failing the whole call — one bad
+/// entry shouldn't discard the user's other choices.
+///
+/// Rows outside the new roots are pruned immediately, and the full-scan stamp
+/// is cleared so the caller's next `needs_full_rescan` returns true: widening
+/// the roots means there is now content we've never walked.
+#[uniffi::export]
+pub fn set_indexed_folders(folders: Vec<String>) -> FolderUpdate {
+    let mut accepted: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+
+    for raw in &folders {
+        match safety::check_index_root(raw) {
+            Ok(p) if p.is_dir() => {
+                let s = p.to_string_lossy().into_owned();
+                if !accepted.contains(&s) {
+                    accepted.push(s);
+                }
+            }
+            _ => rejected.push(raw.clone()),
+        }
+    }
+
+    // Refuse to persist an empty list — that would index nothing at all and
+    // look identical to a broken app. Fall back to the defaults instead.
+    let to_store = if accepted.is_empty() {
+        default_scan_roots()
+    } else {
+        accepted.clone()
+    };
+
+    let mut pruned: u32 = 0;
+    if let Ok(conn) = db::open_default() {
+        if let Ok(json) = serde_json::to_string(&to_store) {
+            let _ = db::set_setting(&conn, SETTING_INDEXED_FOLDERS, &json);
+        }
+
+        // Drop everything that is no longer under any root. Built as one
+        // NOT(... OR ...) so a file kept by any root survives.
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        for (i, root) in to_store.iter().enumerate() {
+            let n = i + 1;
+            clauses.push(format!("(path > ?{n} || '/' AND path < ?{n} || '0')", n = n));
+            binds.push(root.clone());
+        }
+        let sql = format!(
+            "DELETE FROM files WHERE NOT ({})",
+            clauses.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        pruned = conn.execute(&sql, params.as_slice()).unwrap_or(0) as u32;
+
+        // Force a full walk next time: new roots have never been visited.
+        let _ = conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![SETTING_LAST_FULL_SCAN],
+        );
+    }
+
+    FolderUpdate { accepted, rejected, pruned }
 }
 
 /// Sanitize free-text user input into an FTS5 query: replace non-alphanumeric
@@ -1923,20 +2078,25 @@ mod tests {
         let docs = docs_root(&_scope);
 
         assert!(is_indexable(&docs.join("report.pdf"), false));
-        // Extension not on the allow-list.
-        assert!(!is_indexable(&docs.join("core.dump"), false));
-        // A file with no extension is skipped; a directory with none is kept.
-        assert!(!is_indexable(&docs.join("Makefile"), false));
+        // No extension allow-list any more: an unusual extension, or none at
+        // all, is still findable. This is the point of dropping it.
+        assert!(is_indexable(&docs.join("core.dump"), false));
+        assert!(is_indexable(&docs.join("Makefile"), false));
         assert!(is_indexable(&docs.join("Projects"), true));
         // Hidden anywhere in the relative path.
         assert!(!is_indexable(&docs.join(".secret.pdf"), false));
         assert!(!is_indexable(&docs.join(".cache/report.pdf"), false));
+        // Excluded directory names, at any depth.
+        assert!(!is_indexable(&docs.join("Library/prefs.plist"), false));
+        assert!(!is_indexable(&docs.join("app/node_modules/left-pad/index.js"), false));
+        assert!(!is_indexable(&docs.join("py/__pycache__/mod.pyc"), false));
+        // ...but a name merely containing an excluded word is fine.
+        assert!(is_indexable(&docs.join("LibraryNotes/report.pdf"), false));
         // Outside every scan root.
         assert!(!is_indexable(&_scope.path().join("Movies/clip.mp4"), false));
-        // Past the depth budget (root + 6 components).
-        let deep = docs.join("a/b/c/d/e/f.pdf");
-        assert!(!is_indexable(&deep, false));
-        assert!(is_indexable(&docs.join("a/b/c/d/e.pdf"), false));
+        // Past the depth budget (root + 11 components).
+        assert!(!is_indexable(&docs.join("a/b/c/d/e/f/g/h/i/j/k.pdf"), false));
+        assert!(is_indexable(&docs.join("a/b/c/d/e/f/g/h/i/j.pdf"), false));
     }
 
     #[test]
@@ -2043,24 +2203,166 @@ mod tests {
     }
 
     #[test]
-    fn test_index_paths_drops_a_file_renamed_to_an_unindexed_extension() {
+    fn test_index_paths_follows_a_rename_to_both_sides() {
         let _scope = db_scope();
         let docs = docs_root(&_scope);
         let old = docs.join("notes.md");
         fs::write(&old, "x").unwrap();
         assert_eq!(index_paths(vec![old.to_string_lossy().into_owned()]).upserted, 1);
 
-        let new = docs.join("notes.dump");
+        let new = docs.join("minutes.md");
         fs::rename(&old, &new).unwrap();
 
-        // FSEvents reports both sides of a rename.
+        // FSEvents reports both sides of a rename in one batch.
         let update = index_paths(vec![
             old.to_string_lossy().into_owned(),
             new.to_string_lossy().into_owned(),
         ]);
         assert_eq!(update.removed, 1, "the old path is gone from disk");
-        assert_eq!(update.upserted, 0, "the new extension is not indexed");
+        assert_eq!(update.upserted, 1, "the new path takes its place");
         assert!(search_files("notes".to_string(), DateField::Either).is_empty());
+        assert_eq!(search_files("minutes".to_string(), DateField::Either).len(), 1);
+    }
+
+    #[test]
+    fn test_full_scan_excludes_a_gitignore_whitelisted_dotfile() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let proj = docs.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // The idiom that defeated WalkBuilder's hidden filter: ignore the
+        // directory's contents but explicitly whitelist a dotfile.
+        fs::write(proj.join(".gitignore"), "uploads/*\n!uploads/.gitkeep\n").unwrap();
+        let uploads = proj.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        fs::write(uploads.join(".gitkeep"), "").unwrap();
+        fs::write(proj.join("main.rs"), "fn main(){}").unwrap();
+
+        rebuild_index();
+
+        let conn = db::open_default().unwrap();
+        let hidden: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE name LIKE '.%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden, 0, "a whitelisted dotfile must still stay out of the index");
+        // The scan itself worked.
+        assert_eq!(search_files("main".to_string(), DateField::Either).len(), 1);
+    }
+
+    #[test]
+    fn test_index_paths_skips_excluded_directories() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let nm = docs.join("app/node_modules/left-pad");
+        std::fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("index.js"), "x").unwrap();
+        fs::write(docs.join("app/main.js"), "y").unwrap();
+
+        index_paths(vec![docs.join("app").to_string_lossy().into_owned()]);
+
+        assert_eq!(search_files("main".to_string(), DateField::Either).len(), 1);
+        assert!(
+            search_files("left".to_string(), DateField::Either).is_empty(),
+            "node_modules must never reach the index"
+        );
+    }
+
+    // MARK: - indexed folders
+
+    #[test]
+    fn test_set_indexed_folders_accepts_dirs_and_rejects_junk() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let movies = _scope.path().join("Movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        let a_file = docs.join("not-a-dir.txt");
+        fs::write(&a_file, "x").unwrap();
+
+        let update = set_indexed_folders(vec![
+            docs.to_string_lossy().into_owned(),
+            movies.to_string_lossy().into_owned(),
+            a_file.to_string_lossy().into_owned(),      // a file, not a folder
+            "relative/path".to_string(),                 // not absolute
+            "/etc".to_string(),                          // system dir
+            _scope.path().join(".ssh").to_string_lossy().into_owned(), // sensitive
+        ]);
+
+        assert_eq!(update.accepted.len(), 2, "the two real directories");
+        assert_eq!(update.rejected.len(), 4, "file, relative, system, sensitive");
+
+        // And the accepted list is what the indexer will actually walk.
+        let roots = get_indexed_folders();
+        assert!(roots.iter().any(|r| r.ends_with("Documents")));
+        assert!(roots.iter().any(|r| r.ends_with("Movies")));
+    }
+
+    #[test]
+    fn test_set_indexed_folders_prunes_rows_outside_the_new_roots() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        let movies = _scope.path().join("Movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        fs::write(docs.join("keep.md"), "k").unwrap();
+        fs::write(movies.join("drop.md"), "d").unwrap();
+
+        set_indexed_folders(vec![
+            docs.to_string_lossy().into_owned(),
+            movies.to_string_lossy().into_owned(),
+        ]);
+        rebuild_index();
+        assert_eq!(search_files("keep".to_string(), DateField::Either).len(), 1);
+        assert_eq!(search_files("drop".to_string(), DateField::Either).len(), 1);
+
+        // Narrowing the roots must clear out what they no longer cover.
+        let update = set_indexed_folders(vec![docs.to_string_lossy().into_owned()]);
+        assert!(update.pruned > 0, "rows under Movies should have been pruned");
+        assert_eq!(search_files("keep".to_string(), DateField::Either).len(), 1);
+        assert!(search_files("drop".to_string(), DateField::Either).is_empty());
+    }
+
+    #[test]
+    fn test_set_indexed_folders_never_persists_an_empty_list() {
+        let _scope = db_scope();
+        // All rejected -> fall back to defaults rather than indexing nothing.
+        let update = set_indexed_folders(vec!["/etc".to_string()]);
+        assert!(update.accepted.is_empty());
+        assert_eq!(get_indexed_folders(), default_scan_roots());
+    }
+
+    #[test]
+    fn test_a_policy_change_forces_a_full_rescan() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        fs::write(docs.join("a.md"), "a").unwrap();
+        rebuild_index();
+        assert!(!needs_full_rescan(), "fresh scan under the current policy");
+
+        // Simulate an upgrade: rows on disk were collected under older rules.
+        let conn = db::open_default().unwrap();
+        db::set_setting(&conn, SETTING_POLICY_VERSION, "1").unwrap();
+        assert!(
+            needs_full_rescan(),
+            "rows from a previous indexing policy must be re-walked regardless of age"
+        );
+    }
+
+    #[test]
+    fn test_changing_folders_forces_a_full_rescan() {
+        let _scope = db_scope();
+        let docs = docs_root(&_scope);
+        fs::write(docs.join("a.md"), "a").unwrap();
+        rebuild_index();
+        assert!(!needs_full_rescan(), "just scanned");
+
+        set_indexed_folders(vec![docs.to_string_lossy().into_owned()]);
+        assert!(
+            needs_full_rescan(),
+            "new roots have never been walked, so a full scan is required"
+        );
     }
 
     #[test]
