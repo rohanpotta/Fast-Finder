@@ -80,6 +80,10 @@ struct ContentView: View {
     // NL detection
     @State private var isNLQuery: Bool = false
 
+    /// Which date organises the list. Persisted so it survives relaunches —
+    /// it's a stance about how you work, not a per-session toggle.
+    @AppStorage("date_field") private var dateField: DateFieldChoice = .either
+
     // Transient toast (undo result, AI errors, etc.)
     @State private var toastMessage: String? = nil
     @State private var toastIsError: Bool = false
@@ -143,12 +147,16 @@ struct ContentView: View {
 
                 Rectangle().fill(WarpTheme.divider).frame(height: 1)
 
-                // Search Bar
-                SearchBarView(
-                    query: $query,
-                    isNLDetected: isNLQuery,
-                    onSubmit: { handleSearchSubmit() }
-                )
+                // Search bar, with the date-field control alongside it
+                HStack(spacing: 8) {
+                    SearchBarView(
+                        query: $query,
+                        isNLDetected: isNLQuery,
+                        onSubmit: { handleSearchSubmit() }
+                    )
+                    DateFieldPicker(choice: $dateField)
+                        .padding(.trailing, 12)
+                }
 
                 Rectangle().fill(WarpTheme.divider).frame(height: 1)
 
@@ -158,11 +166,13 @@ struct ContentView: View {
                     selection: $selectedFileIds,
                     loadedFolderContents: loadedFolderContents,
                     lastExpandedPath: $lastExpandedPath,
+                    dateColumnTitle: dateField.label,
                     onFolderExpanded: { path in
                         guard loadedFolderContents[path] == nil else { return }
+                        let field = dateField
                         Task {
                             let contents = await Task.detached(priority: .userInitiated) {
-                                loadDirectoryContents(path: path, showHidden: false)
+                                loadDirectoryContents(path: path, showHidden: false, field: field)
                             }.value
                             await MainActor.run {
                                 loadedFolderContents[path] = contents.sorted(using: sortOrder)
@@ -277,6 +287,16 @@ struct ContentView: View {
                 loadedFolderContents.removeAll()
             }
             loadFolder(newItem)
+        }
+        .onChange(of: dateField) { _ in
+            // Changing the field changes which rows qualify, not just their
+            // order, so the current view has to be re-fetched rather than
+            // re-sorted locally.
+            if query.isEmpty {
+                refreshCurrentContent()
+            } else {
+                runSearch(for: query)
+            }
         }
         .onChange(of: query) { newValue in
             let detected = NLDetector.isNaturalLanguage(newValue)
@@ -523,9 +543,10 @@ struct ContentView: View {
     /// Load a folder's contents into the main area (used for sidebar selection and drill-in).
     func loadFolderContents(path: String, showHidden: Bool = false) {
         loadedFolderContents.removeAll()
+        let field = dateField
         Task {
             let contents = await Task.detached(priority: .userInitiated) {
-                return loadDirectoryContents(path: path, showHidden: showHidden)
+                return loadDirectoryContents(path: path, showHidden: showHidden, field: field)
             }.value
             await MainActor.run {
                 self.results = contents
@@ -568,9 +589,10 @@ struct ContentView: View {
         // One indexed query, already filtered and capped in SQL. The old path
         // pulled the whole index (up to 50k rows) across the FFI boundary and
         // then filtered it in Swift.
+        let field = dateField.ffi
         Task {
             let recent = await Task.detached(priority: .userInitiated) {
-                return getRecentFiles()
+                return getRecentFiles(dateField: field, withinDays: 7)
             }.value
 
             await MainActor.run {
@@ -636,7 +658,17 @@ struct ContentView: View {
         }
     }
 
-    func loadDirectoryContents(path: String, showHidden: Bool = false) -> [SearchResult] {
+    /// Live listing for browsing a folder. Not served from the index — a folder
+    /// you're looking at should show what's on disk right now.
+    ///
+    /// `field` has to be passed in rather than read from `dateField` because
+    /// this runs on a detached task; it also has to be honoured here at all,
+    /// or the picker would silently only affect Recents and search.
+    func loadDirectoryContents(
+        path: String,
+        showHidden: Bool = false,
+        field: DateFieldChoice = .either
+    ) -> [SearchResult] {
         var items: [SearchResult] = []
         let fileManager = FileManager.default
 
@@ -653,16 +685,22 @@ struct ContentView: View {
                     let attrs = try? fileManager.attributesOfItem(atPath: fullPath)
                     let size = (attrs?[.size] as? UInt64) ?? 0
 
-                    // Get all three date types
                     let modDate = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
                     let createDate = (attrs?[.creationDate] as? Date) ?? Date.distantPast
 
-                    // Find the most recent date
+                    // Mirrors DateField in the Rust core: the chosen field wins
+                    // outright, and only `.either` falls back to "newer of the two".
                     let (bestDate, dateKind): (Date, String) = {
-                        if createDate > modDate {
-                            return (createDate, "Created")
+                        switch field {
+                        case .added:
+                            return (createDate, "Added")
+                        case .modified:
+                            return (modDate, "Modified")
+                        case .either:
+                            return createDate > modDate
+                                ? (createDate, "Added")
+                                : (modDate, "Modified")
                         }
-                        return (modDate, "Modified")
                     }()
 
                     let dateValue = Int64(bestDate.timeIntervalSince1970)
@@ -758,8 +796,9 @@ struct ContentView: View {
         guard !text.isEmpty else { return [] }
         try? await Task.sleep(nanoseconds: 100_000_000)
         if Task.isCancelled { return [] }
+        let field = dateField.ffi
         return await Task.detached(priority: .userInitiated) {
-            searchFiles(query: text)
+            searchFiles(query: text, dateField: field)
         }.value
     }
 
@@ -1038,6 +1077,9 @@ struct FileOutlineView: NSViewRepresentable {
     @Binding var selection: Set<String>
     let loadedFolderContents: [String: [SearchResult]]
     @Binding var lastExpandedPath: String?
+    /// Header text for the date column — names the field currently in force,
+    /// so the list never shows an unlabelled date whose meaning you can't tell.
+    let dateColumnTitle: String
     let onFolderExpanded: (String) -> Void
     let onDoubleClick: (String) -> Void
 
@@ -1094,6 +1136,12 @@ struct FileOutlineView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let outlineView = scrollView.documentView as? NSOutlineView else { return }
+
+        if let dateColumn = outlineView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("date")),
+           dateColumn.title != dateColumnTitle {
+            dateColumn.title = dateColumnTitle
+            outlineView.headerView?.needsDisplay = true
+        }
 
         let rootChanged = context.coordinator.files.map(\.filePath) != files.map(\.filePath)
         context.coordinator.files = files
