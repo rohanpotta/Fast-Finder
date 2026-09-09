@@ -297,11 +297,8 @@ fn scan_root_for(path: &Path) -> Option<String> {
 /// unlisted — a `Makefile`, an `.xcodeproj`, a file with no extension at all —
 /// permanently unfindable, which is the opposite of replacing Finder.
 ///
-/// Note: the full rescan additionally honours `.gitignore` via `WalkBuilder`.
-/// We deliberately don't reimplement that for single-file events — the cost of
-/// a stray indexed row is far lower than the cost of getting ignore-file
-/// semantics subtly wrong in two places. Directory events re-walk through
-/// `WalkBuilder`, so subtrees stay exact.
+/// This is a *scope* check only. It does not consult `.gitignore`, so it is not
+/// sufficient on its own — see `walker_accepts`.
 fn is_indexable(path: &Path, _is_dir: bool) -> bool {
     let Some(root) = scan_root_for(path) else {
         return false;
@@ -388,6 +385,73 @@ fn upsert_record(
         r.file_kind,
         indexed_at,
     ])
+}
+
+/// Build the gitignore matcher governing `dir`, or None if `dir` isn't inside a
+/// git repository (mirroring `WalkBuilder::require_git(true)`).
+///
+/// Collects every `.gitignore` from the repo root down to `dir`, in that order,
+/// so deeper files override shallower ones the way git does.
+fn build_gitignore_for(dir: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let mut chain: Vec<std::path::PathBuf> = Vec::new();
+    let mut repo_root: Option<std::path::PathBuf> = None;
+    let mut cursor = Some(dir);
+    while let Some(d) = cursor {
+        chain.push(d.to_path_buf());
+        if d.join(".git").exists() {
+            repo_root = Some(d.to_path_buf());
+            break;
+        }
+        cursor = d.parent();
+    }
+    let root = repo_root?;
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+    for d in chain.iter().rev() {
+        let candidate = d.join(".gitignore");
+        if candidate.is_file() {
+            builder.add(candidate);
+        }
+    }
+    builder.build().ok()
+}
+
+/// Is `path` excluded by git's ignore rules?
+///
+/// `is_indexable` is a scope check and knows nothing about `.gitignore`, so on
+/// its own it let every `cargo build` inside an indexed repo pour thousands of
+/// `target/` artifacts into the index through FSEvents — ~14k rows, 40% of the
+/// index, which each full rescan then dutifully removed. The row count swung
+/// depending on whether a scan or an event replay ran last.
+///
+/// The obvious fix — list the file's parent through `WalkBuilder` and check
+/// membership — does not work: the walker never filters its own walk root, so
+/// listing a gitignored directory cheerfully yields its contents. Asking the
+/// gitignore matcher directly is the crate's supported answer, and
+/// `matched_path_or_any_parents` is what makes a rule like `/target/` apply to
+/// `target/debug/build-script-build`.
+///
+/// `cache` is per-batch and keyed by directory, so a batch touching many files
+/// in one directory builds the matcher once.
+fn git_ignored(
+    path: &Path,
+    cache: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        Option<ignore::gitignore::Gitignore>,
+    >,
+) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let entry = cache
+        .entry(parent.to_path_buf())
+        .or_insert_with(|| build_gitignore_for(parent));
+    match entry {
+        Some(gi) => gi
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore(),
+        None => false,
+    }
 }
 
 /// Walk one directory subtree, collecting every indexable entry.
@@ -574,7 +638,9 @@ const SETTING_POLICY_VERSION: &str = "index_policy_version";
 /// `needs_full_rescan` had no way to know the rules had moved underneath it.
 /// 2: dropped the extension allow-list, added directory exclusions, depth 5→10.
 /// 3: hidden-component backstop, so a gitignore-whitelisted dotfile stays out.
-const INDEX_POLICY_VERSION: &str = "3";
+/// 4: single-file events honour .gitignore, so build artifacts stop leaking in.
+/// 5: directory events honour it too — the walker never filters its own root.
+const INDEX_POLICY_VERSION: &str = "5";
 
 /// How long a full rescan stays trustworthy. Past this we assume the FSEvents
 /// stream may have dropped something and re-walk from scratch.
@@ -625,6 +691,11 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
     let now = blocks::now_ts();
     let mut upserted: u32 = 0;
     let mut removed: u32 = 0;
+    // Directory listings reused across this batch — see `walker_accepts`.
+    let mut gitignore_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        Option<ignore::gitignore::Gitignore>,
+    > = std::collections::HashMap::new();
 
     let Ok(tx) = conn.transaction() else {
         return IndexUpdate::empty();
@@ -657,7 +728,11 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
                     removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
                 }
                 Ok(meta) if meta.is_dir() => {
-                    if !is_indexable(path, true) {
+                    // The gitignore check matters just as much here as for a
+                    // single file: WalkBuilder never filters its own walk root,
+                    // so collecting a gitignored directory would happily upsert
+                    // everything inside it.
+                    if !is_indexable(path, true) || git_ignored(path, &mut gitignore_cache) {
                         removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
                         continue;
                     }
@@ -696,14 +771,18 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
                     }
                 }
                 Ok(meta) => {
-                    if is_indexable(path, false) {
+                    // Scope first (cheap), then the walker's own verdict, which
+                    // is what brings `.gitignore` into agreement with the full
+                    // scan. Without the second check, a gitignored build
+                    // artifact gets indexed here and pruned by the next rescan.
+                    if is_indexable(path, false) && !git_ignored(path, &mut gitignore_cache) {
                         let (r, mtime, birthtime) = record_for(path, &meta);
                         if upsert_record(&mut upsert, &r, mtime, birthtime, now).is_ok() {
                             upserted += 1;
                         }
                     } else {
-                        // Renamed into a non-indexed extension, or newly
-                        // hidden — drop any row we were still holding.
+                        // Newly ignored, newly hidden, or out of scope — drop
+                        // any row we were still holding.
                         removed += delete_subtree.execute(params![raw]).unwrap_or(0) as u32;
                     }
                 }
