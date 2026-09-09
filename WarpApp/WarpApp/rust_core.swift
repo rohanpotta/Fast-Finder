@@ -740,6 +740,92 @@ public func FfiConverterTypeSearchResult_lower(_ value: SearchResult) -> RustBuf
     return FfiConverterTypeSearchResult.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which timestamp drives sorting, filtering and the date column.
+ *
+ * `Either` is the historical behaviour: show whichever of the two is more
+ * recent. It's a reasonable default for "what did I touch lately" and a
+ * terrible one for "what landed here last week", which is why the other two
+ * exist and why the choice is the caller's.
+ *
+ * Caveat worth knowing: `Added` is birthtime, i.e. when the file was created.
+ * Finder's "Date Added" column is `kMDItemDateAdded` — when the file arrived
+ * in *that folder* — which differs for anything moved after creation. Closing
+ * that gap means pulling Spotlight metadata into `file_signals`; birthtime is
+ * the honest approximation until then.
+ */
+
+public enum DateField: Equatable, Hashable {
+    
+    case added
+    case modified
+    case either
+
+
+
+}
+
+#if compiler(>=6)
+extension DateField: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDateField: FfiConverterRustBuffer {
+    typealias SwiftType = DateField
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DateField {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .added
+        
+        case 2: return .modified
+        
+        case 3: return .either
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DateField, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .added:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .modified:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .either:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDateField_lift(_ buf: RustBuffer) throws -> DateField {
+    return try FfiConverterTypeDateField.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDateField_lower(_ value: DateField) -> RustBuffer {
+    return FfiConverterTypeDateField.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -841,9 +927,17 @@ public func getFileListingForAi(path: String) -> String  {
     )
 })
 }
-public func getRecentFiles() -> [SearchResult]  {
+/**
+ * Recent files by the selected date field.
+ *
+ * `within_days` bounds the window; 0 means "no lower bound", which is what
+ * makes "everything by date added" answerable rather than silently capped.
+ */
+public func getRecentFiles(dateField: DateField, withinDays: UInt32) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
-    uniffi_rust_core_fn_func_get_recent_files($0
+    uniffi_rust_core_fn_func_get_recent_files(
+        FfiConverterTypeDateField_lower(dateField),
+        FfiConverterUInt32.lower(withinDays),$0
     )
 })
 }
@@ -882,12 +976,13 @@ public func lastEventId() -> UInt64  {
 }
 /**
  * Load the persisted index for instant startup.
- * Returns rows ordered by best-date desc; capped to 50k to keep the FFI
- * crossing cheap. If the DB isn't openable yet (first launch race), returns [].
+ * Returns rows ordered by the selected date desc; capped to 50k to keep the
+ * FFI crossing cheap. If the DB isn't openable yet, returns [].
  */
-public func loadCachedIndex() -> [SearchResult]  {
+public func loadCachedIndex(dateField: DateField) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
-    uniffi_rust_core_fn_func_load_cached_index($0
+    uniffi_rust_core_fn_func_load_cached_index(
+        FfiConverterTypeDateField_lower(dateField),$0
     )
 })
 }
@@ -935,10 +1030,11 @@ public func renameFile(path: String, newName: String) -> FileOpResult  {
     )
 })
 }
-public func searchFiles(query: String) -> [SearchResult]  {
+public func searchFiles(query: String, dateField: DateField) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_search_files(
-        FfiConverterString.lower(query),$0
+        FfiConverterString.lower(query),
+        FfiConverterTypeDateField_lower(dateField),$0
     )
 })
 }
@@ -1003,7 +1099,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_get_file_listing_for_ai() != 40135) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_get_recent_files() != 42150) {
+    if (uniffi_rust_core_checksum_func_get_recent_files() != 23640) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_index_paths() != 32092) {
@@ -1012,7 +1108,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_last_event_id() != 15009) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_load_cached_index() != 38582) {
+    if (uniffi_rust_core_checksum_func_load_cached_index() != 15374) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_move_files() != 44044) {
@@ -1027,7 +1123,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_rename_file() != 42280) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_search_files() != 43504) {
+    if (uniffi_rust_core_checksum_func_search_files() != 63033) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_set_last_event_id() != 5445) {

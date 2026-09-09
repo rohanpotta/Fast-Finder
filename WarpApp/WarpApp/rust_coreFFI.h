@@ -271,8 +271,7 @@ RustBuffer uniffi_rust_core_fn_func_get_file_listing_for_ai(RustBuffer path, Rus
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
-RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustCallStatus *_Nonnull out_status
-    
+RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustBuffer date_field, uint32_t within_days, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_INDEX_PATHS
@@ -288,8 +287,7 @@ uint64_t uniffi_rust_core_fn_func_last_event_id(RustCallStatus *_Nonnull out_sta
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_LOAD_CACHED_INDEX
-RustBuffer uniffi_rust_core_fn_func_load_cached_index(RustCallStatus *_Nonnull out_status
-    
+RustBuffer uniffi_rust_core_fn_func_load_cached_index(RustBuffer date_field, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_MOVE_FILES
@@ -316,7 +314,7 @@ RustBuffer uniffi_rust_core_fn_func_rename_file(RustBuffer path, RustBuffer new_
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
-RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustBuffer date_field, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_LAST_EVENT_ID
