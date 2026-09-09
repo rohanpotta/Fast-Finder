@@ -307,6 +307,11 @@ int8_t uniffi_rust_core_fn_func_needs_full_rescan(RustCallStatus *_Nonnull out_s
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_PARSE_QUERY
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_PARSE_QUERY
+RustBuffer uniffi_rust_core_fn_func_parse_query(RustBuffer raw, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
 RustBuffer uniffi_rust_core_fn_func_rebuild_index(RustCallStatus *_Nonnull out_status
@@ -673,6 +678,12 @@ uint16_t uniffi_rust_core_checksum_func_move_files(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_NEEDS_FULL_RESCAN
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_NEEDS_FULL_RESCAN
 uint16_t uniffi_rust_core_checksum_func_needs_full_rescan(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_PARSE_QUERY
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_PARSE_QUERY
+uint16_t uniffi_rust_core_checksum_func_parse_query(void
     
 );
 #endif

@@ -727,6 +727,144 @@ public func FfiConverterTypeIndexUpdate_lower(_ value: IndexUpdate) -> RustBuffe
 }
 
 
+/**
+ * How the search bar's raw text was understood.
+ */
+public struct ParsedQuery: Equatable, Hashable {
+    /**
+     * The part that goes to full-text search.
+     */
+    public var text: String
+    public var chips: [QueryChip]
+    /**
+     * Tokens that looked like filters but couldn't be read, e.g. `added:banana`.
+     */
+    public var invalid: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The part that goes to full-text search.
+         */text: String, chips: [QueryChip], 
+        /**
+         * Tokens that looked like filters but couldn't be read, e.g. `added:banana`.
+         */invalid: [String]) {
+        self.text = text
+        self.chips = chips
+        self.invalid = invalid
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension ParsedQuery: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeParsedQuery: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ParsedQuery {
+        return
+            try ParsedQuery(
+                text: FfiConverterString.read(from: &buf), 
+                chips: FfiConverterSequenceTypeQueryChip.read(from: &buf), 
+                invalid: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ParsedQuery, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterSequenceTypeQueryChip.write(value.chips, into: &buf)
+        FfiConverterSequenceString.write(value.invalid, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParsedQuery_lift(_ buf: RustBuffer) throws -> ParsedQuery {
+    return try FfiConverterTypeParsedQuery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParsedQuery_lower(_ value: ParsedQuery) -> RustBuffer {
+    return FfiConverterTypeParsedQuery.lower(value)
+}
+
+
+/**
+ * One parsed filter, for the UI to render as a removable chip.
+ */
+public struct QueryChip: Equatable, Hashable {
+    /**
+     * Human-readable, e.g. "PDF" or "added < 7d ago".
+     */
+    public var label: String
+    /**
+     * The original token, so the UI can strip it from the query.
+     */
+    public var token: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Human-readable, e.g. "PDF" or "added < 7d ago".
+         */label: String, 
+        /**
+         * The original token, so the UI can strip it from the query.
+         */token: String) {
+        self.label = label
+        self.token = token
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension QueryChip: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueryChip: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueryChip {
+        return
+            try QueryChip(
+                label: FfiConverterString.read(from: &buf), 
+                token: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QueryChip, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.token, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueryChip_lift(_ buf: RustBuffer) throws -> QueryChip {
+    return try FfiConverterTypeQueryChip.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueryChip_lower(_ value: QueryChip) -> RustBuffer {
+    return FfiConverterTypeQueryChip.lower(value)
+}
+
+
 public struct SearchResult: Equatable, Hashable {
     public var fileName: String
     public var filePath: String
@@ -920,6 +1058,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeQueryChip: FfiConverterRustBuffer {
+    typealias SwiftType = [QueryChip]
+
+    public static func write(_ value: [QueryChip], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQueryChip.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QueryChip] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QueryChip]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQueryChip.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer {
     typealias SwiftType = [SearchResult]
 
@@ -1086,6 +1249,17 @@ public func needsFullRescan() -> Bool  {
 })
 }
 /**
+ * Parse search-bar input without running it, so the UI can show what it
+ * understood as the user types.
+ */
+public func parseQuery(raw: String) -> ParsedQuery  {
+    return try!  FfiConverterTypeParsedQuery_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_parse_query(
+        FfiConverterString.lower(raw),$0
+    )
+})
+}
+/**
  * Full rescan of every scan root. Expensive: this walks the whole tree, so
  * the app should call it on first run or when the incremental event stream
  * has gone stale — `index_paths` handles the steady state.
@@ -1107,6 +1281,14 @@ public func renameFile(path: String, newName: String) -> FileOpResult  {
     )
 })
 }
+/**
+ * Search the index. `query` may mix free text with filter tokens
+ * (`report kind:pdf added:<7d`); filters alone are a valid query.
+ *
+ * Everything happens in SQLite against indexed columns — no network, no model
+ * call. That's the point: `kind:pdf added:<7d` used to be expressible only as
+ * prose through the AI bar.
+ */
 public func searchFiles(query: String, dateField: DateField) -> [SearchResult]  {
     return try!  FfiConverterSequenceTypeSearchResult.lift(try! rustCall() {
     uniffi_rust_core_fn_func_search_files(
@@ -1215,13 +1397,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_needs_full_rescan() != 6768) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rust_core_checksum_func_parse_query() != 11403) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_rebuild_index() != 60778) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_rename_file() != 42280) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_rust_core_checksum_func_search_files() != 63033) {
+    if (uniffi_rust_core_checksum_func_search_files() != 34863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_set_indexed_folders() != 59577) {
