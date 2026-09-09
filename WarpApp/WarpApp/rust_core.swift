@@ -606,6 +606,72 @@ public func FfiConverterTypeFileOpResult_lower(_ value: FileOpResult) -> RustBuf
 
 
 /**
+ * Outcome of changing the folder list, so the UI can report what happened
+ * instead of silently succeeding.
+ */
+public struct FolderUpdate: Equatable, Hashable {
+    public var accepted: [String]
+    public var rejected: [String]
+    /**
+     * Rows dropped because they no longer sit under any indexed folder.
+     */
+    public var pruned: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(accepted: [String], rejected: [String], 
+        /**
+         * Rows dropped because they no longer sit under any indexed folder.
+         */pruned: UInt32) {
+        self.accepted = accepted
+        self.rejected = rejected
+        self.pruned = pruned
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension FolderUpdate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFolderUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FolderUpdate {
+        return
+            try FolderUpdate(
+                accepted: FfiConverterSequenceString.read(from: &buf), 
+                rejected: FfiConverterSequenceString.read(from: &buf), 
+                pruned: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FolderUpdate, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.accepted, into: &buf)
+        FfiConverterSequenceString.write(value.rejected, into: &buf)
+        FfiConverterUInt32.write(value.pruned, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderUpdate_lift(_ buf: RustBuffer) throws -> FolderUpdate {
+    return try FfiConverterTypeFolderUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderUpdate_lower(_ value: FolderUpdate) -> RustBuffer {
+    return FfiConverterTypeFolderUpdate.lower(value)
+}
+
+
+/**
  * What one incremental pass changed. Returned so the UI can skip a refresh
  * when nothing actually moved.
  */
@@ -928,6 +994,17 @@ public func getFileListingForAi(path: String) -> String  {
 })
 }
 /**
+ * Folders currently indexed. This is the real list the indexer uses — the
+ * Settings UI reads it from here rather than keeping its own copy, which is
+ * how it ended up displaying three folders it had no influence over.
+ */
+public func getIndexedFolders() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_get_indexed_folders($0
+    )
+})
+}
+/**
  * Recent files by the selected date field.
  *
  * `within_days` bounds the window; 0 means "no lower bound", which is what
@@ -1039,6 +1116,24 @@ public func searchFiles(query: String, dateField: DateField) -> [SearchResult]  
 })
 }
 /**
+ * Replace the indexed-folder list.
+ *
+ * Rejects anything that isn't an existing directory or that `safety` refuses
+ * as a read root, and reports it rather than failing the whole call — one bad
+ * entry shouldn't discard the user's other choices.
+ *
+ * Rows outside the new roots are pruned immediately, and the full-scan stamp
+ * is cleared so the caller's next `needs_full_rescan` returns true: widening
+ * the roots means there is now content we've never walked.
+ */
+public func setIndexedFolders(folders: [String]) -> FolderUpdate  {
+    return try!  FfiConverterTypeFolderUpdate_lift(try! rustCall() {
+    uniffi_rust_core_fn_func_set_indexed_folders(
+        FfiConverterSequenceString.lower(folders),$0
+    )
+})
+}
+/**
  * Persist the FSEvents id reached after a successful `index_paths` pass.
  */
 public func setLastEventId(id: UInt64)  {try! rustCall() {
@@ -1099,6 +1194,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_get_file_listing_for_ai() != 40135) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rust_core_checksum_func_get_indexed_folders() != 24405) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_get_recent_files() != 23640) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1124,6 +1222,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_search_files() != 63033) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_set_indexed_folders() != 59577) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_set_last_event_id() != 5445) {

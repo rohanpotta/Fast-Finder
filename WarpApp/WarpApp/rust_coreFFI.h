@@ -269,6 +269,12 @@ RustBuffer uniffi_rust_core_fn_func_create_folder(RustBuffer path, RustCallStatu
 RustBuffer uniffi_rust_core_fn_func_get_file_listing_for_ai(RustBuffer path, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_INDEXED_FOLDERS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_INDEXED_FOLDERS
+RustBuffer uniffi_rust_core_fn_func_get_indexed_folders(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_GET_RECENT_FILES
 RustBuffer uniffi_rust_core_fn_func_get_recent_files(RustBuffer date_field, uint32_t within_days, RustCallStatus *_Nonnull out_status
@@ -315,6 +321,11 @@ RustBuffer uniffi_rust_core_fn_func_rename_file(RustBuffer path, RustBuffer new_
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SEARCH_FILES
 RustBuffer uniffi_rust_core_fn_func_search_files(RustBuffer query, RustBuffer date_field, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_INDEXED_FOLDERS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_INDEXED_FOLDERS
+RustBuffer uniffi_rust_core_fn_func_set_indexed_folders(RustBuffer folders, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_SET_LAST_EVENT_ID
@@ -623,6 +634,12 @@ uint16_t uniffi_rust_core_checksum_func_get_file_listing_for_ai(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_INDEXED_FOLDERS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_INDEXED_FOLDERS
+uint16_t uniffi_rust_core_checksum_func_get_indexed_folders(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_GET_RECENT_FILES
 uint16_t uniffi_rust_core_checksum_func_get_recent_files(void
@@ -674,6 +691,12 @@ uint16_t uniffi_rust_core_checksum_func_rename_file(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SEARCH_FILES
 uint16_t uniffi_rust_core_checksum_func_search_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SET_INDEXED_FOLDERS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_SET_INDEXED_FOLDERS
+uint16_t uniffi_rust_core_checksum_func_set_indexed_folders(void
     
 );
 #endif
