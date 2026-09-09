@@ -105,19 +105,22 @@ fn get_file_kind(path: &std::path::Path, is_folder: bool) -> String {
     }.to_string()
 }
 
-// Only use mtime and ctime (atime is unreliable on macOS)
+// Only use mtime and birthtime (atime is unreliable on macOS)
 fn get_best_date(metadata: &std::fs::Metadata) -> (i64, &'static str) {
-    let (mtime, ctime) = extract_times(metadata);
-    if ctime > mtime {
-        (ctime, "Created")
+    let (mtime, birthtime) = extract_times(metadata);
+    if birthtime > mtime {
+        (birthtime, "Added")
     } else {
         (mtime, "Modified")
     }
 }
 
-/// Raw (mtime, ctime) extraction. Storing both lets the ranking layer reason
-/// about "created in the last week" vs "modified yesterday" — losing one
-/// to a tiebreak (as the old code did) would degrade future ranking signals.
+/// Raw (mtime, birthtime) extraction.
+///
+/// `created()` maps to st_birthtime on macOS — when the file came into
+/// existence — not st_ctime. Storing both is what makes "sort by date added"
+/// answerable at all; collapsing them to whichever is newer (which every read
+/// path used to do) throws away the distinction the user actually wants.
 fn extract_times(metadata: &std::fs::Metadata) -> (i64, i64) {
     let mtime = metadata
         .modified()
@@ -125,13 +128,64 @@ fn extract_times(metadata: &std::fs::Metadata) -> (i64, i64) {
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let ctime = metadata
+    let birthtime = metadata
         .created()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    (mtime, ctime)
+    (mtime, birthtime)
+}
+
+// ============== DATE FIELD SELECTION ==============
+
+/// Which timestamp drives sorting, filtering and the date column.
+///
+/// `Either` is the historical behaviour: show whichever of the two is more
+/// recent. It's a reasonable default for "what did I touch lately" and a
+/// terrible one for "what landed here last week", which is why the other two
+/// exist and why the choice is the caller's.
+///
+/// Caveat worth knowing: `Added` is birthtime, i.e. when the file was created.
+/// Finder's "Date Added" column is `kMDItemDateAdded` — when the file arrived
+/// in *that folder* — which differs for anything moved after creation. Closing
+/// that gap means pulling Spotlight metadata into `file_signals`; birthtime is
+/// the honest approximation until then.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DateField {
+    Added,
+    Modified,
+    Either,
+}
+
+impl DateField {
+    /// SQL expression yielding the timestamp this field selects.
+    ///
+    /// `birthtime` is 0 when the filesystem couldn't supply one (rare on
+    /// APFS/HFS+, but possible on network mounts). Falling back to mtime keeps
+    /// those rows in a sensible sort position instead of dumping them at the
+    /// very bottom as an unexplained block of zeroes.
+    fn value_expr(&self, prefix: &str) -> String {
+        match self {
+            DateField::Added => {
+                format!("COALESCE(NULLIF({p}birthtime, 0), {p}mtime)", p = prefix)
+            }
+            DateField::Modified => format!("{p}mtime", p = prefix),
+            DateField::Either => format!("MAX({p}mtime, {p}birthtime)", p = prefix),
+        }
+    }
+
+    /// SQL expression yielding the label shown next to the date.
+    fn kind_expr(&self, prefix: &str) -> String {
+        match self {
+            DateField::Added => "'Added'".to_string(),
+            DateField::Modified => "'Modified'".to_string(),
+            DateField::Either => format!(
+                "CASE WHEN {p}birthtime > {p}mtime THEN 'Added' ELSE 'Modified' END",
+                p = prefix
+            ),
+        }
+    }
 }
 
 // ============== INDEXING POLICY ==============
@@ -221,10 +275,10 @@ fn is_indexable(path: &Path, is_dir: bool) -> bool {
     extension_allows(path, is_dir)
 }
 
-/// Build the FFI record plus the raw (mtime, ctime) we persist alongside it.
+/// Build the FFI record plus the raw (mtime, birthtime) we persist alongside it.
 fn record_for(path: &Path, metadata: &fs::Metadata) -> (SearchResult, i64, i64) {
     let is_folder = metadata.is_dir();
-    let (mtime, ctime) = extract_times(metadata);
+    let (mtime, birthtime) = extract_times(metadata);
     let (date_value, date_kind) = get_best_date(metadata);
     (
         SearchResult {
@@ -242,7 +296,7 @@ fn record_for(path: &Path, metadata: &fs::Metadata) -> (SearchResult, i64, i64) 
             pretty_date: format_relative_date(date_value),
         },
         mtime,
-        ctime,
+        birthtime,
     )
 }
 
@@ -258,7 +312,7 @@ const DESCENDANTS_OF: &str = "path > ?1 || '/' AND path < ?1 || '0'";
 
 /// UPSERT on `path` so file ids stay stable across reindexes — `blocks` and
 /// `embeddings` FK into `files(id)` and must not be orphaned by a rescan.
-const UPSERT_FILE_SQL: &str = "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
+const UPSERT_FILE_SQL: &str = "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT(path) DO UPDATE SET
          name       = excluded.name,
@@ -267,7 +321,7 @@ const UPSERT_FILE_SQL: &str = "INSERT INTO files (path, name, parent_dir, ext, s
          size       = excluded.size,
          is_dir     = excluded.is_dir,
          mtime      = excluded.mtime,
-         ctime      = excluded.ctime,
+         birthtime      = excluded.birthtime,
          file_kind  = excluded.file_kind,
          indexed_at = excluded.indexed_at";
 
@@ -276,7 +330,7 @@ fn upsert_record(
     stmt: &mut rusqlite::Statement,
     r: &SearchResult,
     mtime: i64,
-    ctime: i64,
+    birthtime: i64,
     indexed_at: i64,
 ) -> rusqlite::Result<usize> {
     let p = Path::new(&r.file_path);
@@ -293,7 +347,7 @@ fn upsert_record(
         r.file_size as i64,
         r.is_folder as i64,
         mtime,
-        ctime,
+        birthtime,
         r.file_kind,
         indexed_at,
     ])
@@ -335,23 +389,26 @@ fn collect_subtree(root: &str, max_depth: usize) -> Vec<(SearchResult, i64, i64)
 }
 
 /// Load the persisted index for instant startup.
-/// Returns rows ordered by best-date desc; capped to 50k to keep the FFI
-/// crossing cheap. If the DB isn't openable yet (first launch race), returns [].
+/// Returns rows ordered by the selected date desc; capped to 50k to keep the
+/// FFI crossing cheap. If the DB isn't openable yet, returns [].
 #[uniffi::export]
-pub fn load_cached_index() -> Vec<SearchResult> {
+pub fn load_cached_index(date_field: DateField) -> Vec<SearchResult> {
     let conn = match db::open_default() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut stmt = match conn.prepare(
+    let sql = format!(
         "SELECT path, name, size, is_dir, file_kind,
-                MAX(mtime, ctime) AS date_value,
-                CASE WHEN ctime > mtime THEN 'Created' ELSE 'Modified' END AS date_kind,
-                MAX(mtime, ctime) AS score
+                {value} AS date_value,
+                {kind} AS date_kind,
+                {value} AS score
          FROM files
          ORDER BY date_value DESC
          LIMIT 50000",
-    ) {
+        value = date_field.value_expr(""),
+        kind = date_field.kind_expr(""),
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -421,8 +478,8 @@ pub fn rebuild_index() -> Vec<SearchResult> {
         if let Ok(tx) = conn.transaction() {
             {
                 if let Ok(mut stmt) = tx.prepare(UPSERT_FILE_SQL) {
-                    for (r, mtime, ctime) in &collected {
-                        let _ = upsert_record(&mut stmt, r, *mtime, *ctime, now);
+                    for (r, mtime, birthtime) in &collected {
+                        let _ = upsert_record(&mut stmt, r, *mtime, *birthtime, now);
                     }
                 }
 
@@ -553,8 +610,8 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
                     let on_disk: HashSet<&str> =
                         found.iter().map(|(r, _, _)| r.file_path.as_str()).collect();
 
-                    for (r, mtime, ctime) in &found {
-                        if upsert_record(&mut upsert, r, *mtime, *ctime, now).is_ok() {
+                    for (r, mtime, birthtime) in &found {
+                        if upsert_record(&mut upsert, r, *mtime, *birthtime, now).is_ok() {
                             upserted += 1;
                         }
                     }
@@ -577,8 +634,8 @@ pub fn index_paths(paths: Vec<String>) -> IndexUpdate {
                 }
                 Ok(meta) => {
                     if is_indexable(path, false) {
-                        let (r, mtime, ctime) = record_for(path, &meta);
-                        if upsert_record(&mut upsert, &r, mtime, ctime, now).is_ok() {
+                        let (r, mtime, birthtime) = record_for(path, &meta);
+                        if upsert_record(&mut upsert, &r, mtime, birthtime, now).is_ok() {
                             upserted += 1;
                         }
                     } else {
@@ -658,7 +715,7 @@ fn build_fts_query(raw: &str) -> Option<String> {
 }
 
 #[uniffi::export]
-pub fn search_files(query: String) -> Vec<SearchResult> {
+pub fn search_files(query: String, date_field: DateField) -> Vec<SearchResult> {
     let Some(fts) = build_fts_query(&query) else {
         return Vec::new();
     };
@@ -668,18 +725,21 @@ pub fn search_files(query: String) -> Vec<SearchResult> {
 
     // bm25() returns negative numbers; lower = better. We invert into a
     // positive score so the existing Swift sort-by-score-desc behavior
-    // continues to work. Recency is the second sort key for tie-breaks.
-    let mut stmt = match conn.prepare(
+    // continues to work. The selected date is the second sort key for ties.
+    let sql = format!(
         "SELECT f.path, f.name, f.size, f.is_dir, f.file_kind,
-                MAX(f.mtime, f.ctime) AS date_value,
-                CASE WHEN f.ctime > f.mtime THEN 'Created' ELSE 'Modified' END AS date_kind,
+                {value} AS date_value,
+                {kind} AS date_kind,
                 CAST(-bm25(files_fts) * 1000 AS INTEGER) AS score
          FROM files_fts
          JOIN files f ON f.id = files_fts.rowid
          WHERE files_fts MATCH ?1
          ORDER BY score DESC, date_value DESC
          LIMIT 50",
-    ) {
+        value = date_field.value_expr("f."),
+        kind = date_field.kind_expr("f."),
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -689,29 +749,44 @@ pub fn search_files(query: String) -> Vec<SearchResult> {
         .unwrap_or_default()
 }
 
+/// Recent files by the selected date field.
+///
+/// `within_days` bounds the window; 0 means "no lower bound", which is what
+/// makes "everything by date added" answerable rather than silently capped.
 #[uniffi::export]
-pub fn get_recent_files() -> Vec<SearchResult> {
+pub fn get_recent_files(date_field: DateField, within_days: u32) -> Vec<SearchResult> {
     let Ok(conn) = db::open_default() else {
         return Vec::new();
     };
-    let week_ago = blocks::now_ts() - (60 * 60 * 24 * 7);
+    let cutoff = if within_days == 0 {
+        0
+    } else {
+        blocks::now_ts() - (60 * 60 * 24 * within_days as i64)
+    };
 
-    let mut stmt = match conn.prepare(
+    // The cutoff is applied to the same expression that's selected and sorted
+    // on, so switching the field changes which files qualify — not just their
+    // order. That's the whole point: "added this week" and "modified this
+    // week" are different sets, and the old MAX() collapsed them into one.
+    let sql = format!(
         "SELECT path, name, size, is_dir, file_kind,
-                MAX(mtime, ctime) AS date_value,
-                CASE WHEN ctime > mtime THEN 'Created' ELSE 'Modified' END AS date_kind,
-                MAX(mtime, ctime) AS score
+                {value} AS date_value,
+                {kind} AS date_kind,
+                {value} AS score
          FROM files
-         WHERE MAX(mtime, ctime) > ?1
+         WHERE {value} > ?1
            AND is_dir = 0
          ORDER BY date_value DESC
          LIMIT 50",
-    ) {
+        value = date_field.value_expr(""),
+        kind = date_field.kind_expr(""),
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
-    stmt.query_map(params![week_ago], map_row)
+    stmt.query_map(params![cutoff], map_row)
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
 }
@@ -1425,13 +1500,13 @@ mod tests {
 
     #[test]
     fn test_search_files_empty_query() {
-        let results = search_files("".to_string());
+        let results = search_files("".to_string(), DateField::Either);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_files_whitespace_query() {
-        let results = search_files("   ".to_string());
+        let results = search_files("   ".to_string(), DateField::Either);
         assert!(results.is_empty());
     }
 
@@ -1455,12 +1530,12 @@ mod tests {
         {
             let conn = db::open_default().unwrap();
             conn.execute(
-                "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
+                "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
                  VALUES ('/tmp/Report Q3.pdf', 'Report Q3.pdf', '/tmp', 'pdf', 1024, 0, 1700000000, 0, 'PDF Document', 1700000000)",
                 [],
             ).unwrap();
         }
-        let hits = search_files("repor".to_string());
+        let hits = search_files("repor".to_string(), DateField::Either);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "Report Q3.pdf");
         assert_eq!(hits[0].file_path, "/tmp/Report Q3.pdf");
@@ -1822,13 +1897,13 @@ mod tests {
         let last_year = now - 60 * 60 * 24 * 400;
 
         conn.execute(
-            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
              VALUES ('/tmp/fresh.txt', 'fresh.txt', '/tmp', 'txt', 1, 0, ?1, 0, 'Plain Text', ?1),
                     ('/tmp/old.txt',   'old.txt',   '/tmp', 'txt', 1, 0, ?2, 0, 'Plain Text', ?2)",
             rusqlite::params![yesterday, last_year],
         ).unwrap();
 
-        let recents = get_recent_files();
+        let recents = get_recent_files(DateField::Either, 7);
         assert_eq!(recents.len(), 1, "only the recent file should appear");
         assert_eq!(recents[0].file_name, "fresh.txt");
     }
@@ -1876,7 +1951,7 @@ mod tests {
         assert_eq!(update.removed, 0);
 
         // Reachable through FTS, i.e. the mirror triggers fired.
-        let hits = search_files("notes".to_string());
+        let hits = search_files("notes".to_string(), DateField::Either);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_path, f.to_string_lossy());
     }
@@ -1912,7 +1987,7 @@ mod tests {
 
         let update = index_paths(arg);
         assert_eq!(update.removed, 1);
-        assert!(search_files("gone".to_string()).is_empty());
+        assert!(search_files("gone".to_string(), DateField::Either).is_empty());
     }
 
     #[test]
@@ -1946,8 +2021,8 @@ mod tests {
         fs::remove_file(proj.join("b.md")).unwrap();
         let second = index_paths(arg);
         assert_eq!(second.removed, 1, "b.md should be pruned by the subtree diff");
-        assert!(search_files("b".to_string()).is_empty());
-        assert_eq!(search_files("a".to_string()).len(), 1);
+        assert!(search_files("b".to_string(), DateField::Either).is_empty());
+        assert_eq!(search_files("a".to_string(), DateField::Either).len(), 1);
     }
 
     #[test]
@@ -1964,7 +2039,7 @@ mod tests {
         let update = index_paths(arg);
         // The directory row and the file beneath it.
         assert_eq!(update.removed, 2);
-        assert!(search_files("a".to_string()).is_empty());
+        assert!(search_files("a".to_string(), DateField::Either).is_empty());
     }
 
     #[test]
@@ -1985,7 +2060,7 @@ mod tests {
         ]);
         assert_eq!(update.removed, 1, "the old path is gone from disk");
         assert_eq!(update.upserted, 0, "the new extension is not indexed");
-        assert!(search_files("notes".to_string()).is_empty());
+        assert!(search_files("notes".to_string(), DateField::Either).is_empty());
     }
 
     #[test]
@@ -2028,7 +2103,7 @@ mod tests {
             target.to_string_lossy().into_owned(),
             bystander.to_string_lossy().into_owned(),
         ]);
-        assert_eq!(search_files("b".to_string()).len(), 1, "precondition");
+        assert_eq!(search_files("b".to_string(), DateField::Either).len(), 1, "precondition");
 
         // Re-index only `tax_2025`. Nothing under `taxX2025` may be pruned.
         index_paths(vec![target.to_string_lossy().into_owned()]);
@@ -2090,6 +2165,101 @@ mod tests {
         );
         assert!(!result.success, "LaunchAgents is code-execution at login");
         assert!(src.exists(), "source must be untouched");
+    }
+
+    // MARK: - date field selection
+
+    /// Two files that disagree about which date is which:
+    ///   `old_file_touched_today` was added long ago, modified today
+    ///   `new_file_untouched`     was added today, never modified since
+    /// Under the old MAX(mtime, birthtime) both look "recent" and there was no
+    /// way to tell them apart. That's the complaint this phase exists to fix.
+    fn seed_divergent_dates(now: i64) {
+        let conn = db::open_default().unwrap();
+        let long_ago = now - 60 * 60 * 24 * 300;
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/old_added.txt', 'old_added.txt', '/tmp', 'txt', 1, 0, ?1, ?2, 'Plain Text', ?1),
+                    ('/tmp/new_added.txt', 'new_added.txt', '/tmp', 'txt', 1, 0, ?2, ?1, 'Plain Text', ?1)",
+            rusqlite::params![now, long_ago],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_recents_by_added_and_modified_select_different_files() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        seed_divergent_dates(now);
+
+        // Modified this week: only the file touched today.
+        let modified = get_recent_files(DateField::Modified, 7);
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].file_name, "old_added.txt");
+        assert_eq!(modified[0].date_kind, "Modified");
+
+        // Added this week: only the file that landed today. Different set,
+        // not merely a different order.
+        let added = get_recent_files(DateField::Added, 7);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].file_name, "new_added.txt");
+        assert_eq!(added[0].date_kind, "Added");
+
+        // Either: both qualify, which is exactly the mushy old behaviour.
+        assert_eq!(get_recent_files(DateField::Either, 7).len(), 2);
+    }
+
+    #[test]
+    fn test_within_days_zero_means_no_lower_bound() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        seed_divergent_dates(now);
+
+        // Both files were added at some point, however long ago.
+        assert_eq!(get_recent_files(DateField::Added, 0).len(), 2);
+        assert_eq!(get_recent_files(DateField::Modified, 0).len(), 2);
+    }
+
+    #[test]
+    fn test_search_orders_ties_by_the_selected_date() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        let long_ago = now - 60 * 60 * 24 * 300;
+        let conn = db::open_default().unwrap();
+        // Identical names so bm25 ties and the date field breaks it.
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/a/report.txt', 'report.txt', '/tmp/a', 'txt', 1, 0, ?1, ?2, 'Plain Text', ?1),
+                    ('/tmp/b/report.txt', 'report.txt', '/tmp/b', 'txt', 1, 0, ?2, ?1, 'Plain Text', ?1)",
+            rusqlite::params![now, long_ago],
+        )
+        .unwrap();
+
+        let by_modified = search_files("report".to_string(), DateField::Modified);
+        assert_eq!(by_modified.len(), 2);
+        assert_eq!(by_modified[0].file_path, "/tmp/a/report.txt");
+
+        let by_added = search_files("report".to_string(), DateField::Added);
+        assert_eq!(by_added.len(), 2);
+        assert_eq!(by_added[0].file_path, "/tmp/b/report.txt", "added flips the tie-break");
+    }
+
+    #[test]
+    fn test_added_falls_back_to_mtime_when_birthtime_is_missing() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        // birthtime 0 = filesystem couldn't supply one.
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/nobirth.txt', 'nobirth.txt', '/tmp', 'txt', 1, 0, ?1, 0, 'Plain Text', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+
+        let added = get_recent_files(DateField::Added, 7);
+        assert_eq!(added.len(), 1, "must not be stranded at timestamp zero");
+        assert_eq!(added[0].date_value, now, "falls back to mtime");
     }
 
     #[test]

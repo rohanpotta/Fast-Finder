@@ -129,7 +129,7 @@ mod tests {
     fn fts_triggers_mirror_files() {
         let conn = fresh_conn();
         conn.execute(
-            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, ctime, file_kind, indexed_at)
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
              VALUES ('/tmp/Report Q3.pdf', 'Report Q3.pdf', '/tmp', 'pdf', 1024, 0, 100, 100, 'PDF Document', 100)",
             [],
         ).unwrap();
