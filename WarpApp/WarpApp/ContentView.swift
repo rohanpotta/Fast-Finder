@@ -80,6 +80,9 @@ struct ContentView: View {
     // NL detection
     @State private var isNLQuery: Bool = false
 
+    /// How the current query text was parsed into filters, for the chips row.
+    @State private var parsedQuery: ParsedQuery?
+
     /// Which date organises the list. Persisted so it survives relaunches —
     /// it's a stance about how you work, not a per-session toggle.
     @AppStorage("date_field") private var dateField: DateFieldChoice = .either
@@ -150,6 +153,12 @@ struct ContentView: View {
                     )
                     DateFieldPicker(choice: $dateField)
                         .padding(.trailing, 12)
+                }
+
+                if let parsed = parsedQuery {
+                    FilterChipsBar(parsed: parsed, onRemove: { token in
+                        removeFilterToken(token)
+                    })
                 }
 
                 Rectangle().fill(WarpTheme.divider).frame(height: 1)
@@ -293,7 +302,13 @@ struct ContentView: View {
             }
         }
         .onChange(of: query) { newValue in
-            let detected = NLDetector.isNaturalLanguage(newValue)
+            let parsed = parseQuery(raw: newValue)
+            parsedQuery = newValue.isEmpty ? nil : parsed
+
+            // A query carrying filter tokens is a structured request, never a
+            // natural-language one — otherwise `find kind:pdf` would be handed
+            // to the AI bar and cost a round trip to answer locally.
+            let detected = parsed.chips.isEmpty && NLDetector.isNaturalLanguage(newValue)
             withAnimation(.easeInOut(duration: 0.2)) {
                 isNLQuery = detected
             }
@@ -783,6 +798,16 @@ struct ContentView: View {
         if diff < 2592000 { return "\(diff / 604800)w ago" }
         if diff < 31536000 { return "\(diff / 2592000)mo ago" }
         return "\(diff / 31536000)y ago"
+    }
+
+    /// Drop one filter token from the query, so a chip's × is a real control
+    /// rather than a decoration the user then has to undo by editing text.
+    private func removeFilterToken(_ token: String) {
+        let remaining = query
+            .split(separator: " ", omittingEmptySubsequences: true)
+            .filter { $0 != token }
+            .joined(separator: " ")
+        query = remaining
     }
 
     func runSearch(for text: String) {

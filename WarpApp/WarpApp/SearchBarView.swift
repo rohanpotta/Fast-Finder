@@ -21,7 +21,7 @@ struct SearchBarView: View {
             .font(.system(size: 16))
             .animation(.easeInOut(duration: 0.2), value: isNLDetected)
 
-            TextField("Search files or ask AI...", text: $query)
+            TextField("Search files, kind:pdf added:<7d, or ask AI…", text: $query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 15))
                 .foregroundColor(WarpTheme.textPrimary)
