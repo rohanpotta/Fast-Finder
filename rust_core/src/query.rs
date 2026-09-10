@@ -51,7 +51,9 @@ impl DateColumn {
         match self {
             // Mirrors DateField::Added's fallback so a filter and the sort
             // column can't disagree about the same file.
-            DateColumn::Added => "COALESCE(NULLIF({p}birthtime, 0), {p}mtime)",
+            DateColumn::Added => {
+                "COALESCE(NULLIF({p}date_added, 0), NULLIF({p}birthtime, 0), {p}mtime)"
+            }
             DateColumn::Modified => "{p}mtime",
         }
     }

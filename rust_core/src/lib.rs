@@ -168,9 +168,13 @@ impl DateField {
     /// very bottom as an unexplained block of zeroes.
     fn value_expr(&self, prefix: &str) -> String {
         match self {
-            DateField::Added => {
-                format!("COALESCE(NULLIF({p}birthtime, 0), {p}mtime)", p = prefix)
-            }
+            DateField::Added => format!(
+                // Spotlight's true "arrived in this folder" date first, then
+                // creation time, then mtime. Each NULLIF guards the sentinel
+                // 0 that means "asked, nothing available".
+                "COALESCE(NULLIF({p}date_added, 0), NULLIF({p}birthtime, 0), {p}mtime)",
+                p = prefix
+            ),
             DateField::Modified => format!("{p}mtime", p = prefix),
             DateField::Either => format!("MAX({p}mtime, {p}birthtime)", p = prefix),
         }
@@ -965,6 +969,101 @@ const SEARCH_LIMIT: usize = 200;
 /// An earlier value of 800 put the ceiling at ~2,970, well beyond the entire
 /// relevance spread, which made usage silently override what the user typed.
 const FRECENCY_BOOST: f64 = 300.0;
+
+// ============== SPOTLIGHT SIGNALS ==============
+
+/// Metadata Spotlight knows about a file that the filesystem alone doesn't.
+///
+/// `None` means "Spotlight had no value", which is distinct from zero and gets
+/// stored as the 0 sentinel so the puller doesn't keep re-asking.
+#[derive(uniffi::Record, Clone)]
+pub struct FileSignal {
+    pub path: String,
+    /// kMDItemDateAdded — when the file arrived in its current folder.
+    pub date_added: Option<i64>,
+    /// kMDItemLastUsedDate — when it was last opened, by any app.
+    pub last_used_date: Option<i64>,
+    /// kMDItemUseCount — how often, according to the system.
+    pub use_count: Option<i64>,
+}
+
+/// Indexed files that have never been through the Spotlight puller.
+///
+/// `date_added IS NULL` is the "not yet asked" marker; a file Spotlight had
+/// nothing for gets 0, so it isn't retried on every pass. That makes the puller
+/// naturally incremental: the first run covers the index, later runs only pick
+/// up newly indexed files.
+#[uniffi::export]
+pub fn paths_needing_signals(limit: u32) -> Vec<String> {
+    let Ok(conn) = db::open_default() else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT path FROM files WHERE date_added IS NULL ORDER BY mtime DESC LIMIT ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![limit], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Fold a batch of Spotlight readings into the index.
+///
+/// Usage counters are merged with `MAX` rather than overwritten: the app's own
+/// `record_open` tracking and Spotlight's system-wide counts are both partial
+/// views, and a later puller pass must not undo opens we recorded ourselves.
+#[uniffi::export]
+pub fn record_signals(signals: Vec<FileSignal>) -> u32 {
+    if signals.is_empty() {
+        return 0;
+    }
+    let Ok(mut conn) = db::open_default() else {
+        return 0;
+    };
+    let now = blocks::now_ts();
+    let mut applied: u32 = 0;
+
+    let Ok(tx) = conn.transaction() else { return 0 };
+    {
+        let (Ok(mut set_added), Ok(mut set_usage)) = (
+            // 0 marks "asked, nothing there" so the puller stops retrying.
+            tx.prepare("UPDATE files SET date_added = ?2 WHERE path = ?1"),
+            tx.prepare(
+                "INSERT INTO file_signals (file_id, last_used_date, use_count, updated_at)
+                 SELECT id, ?2, ?3, ?4 FROM files WHERE path = ?1
+                 ON CONFLICT(file_id) DO UPDATE SET
+                     last_used_date = MAX(COALESCE(last_used_date, 0), COALESCE(excluded.last_used_date, 0)),
+                     use_count      = MAX(use_count, excluded.use_count),
+                     updated_at     = excluded.updated_at",
+            ),
+        ) else {
+            return 0;
+        };
+
+        for s in &signals {
+            if set_added
+                .execute(params![s.path, s.date_added.unwrap_or(0)])
+                .unwrap_or(0)
+                > 0
+            {
+                applied += 1;
+            }
+            // Only worth a signals row if Spotlight actually knew something.
+            if s.last_used_date.is_some() || s.use_count.is_some() {
+                let _ = set_usage.execute(params![
+                    s.path,
+                    s.last_used_date.unwrap_or(0),
+                    s.use_count.unwrap_or(0),
+                    now,
+                ]);
+            }
+        }
+    }
+    let _ = tx.commit();
+    applied
+}
 
 /// Record that the user opened a file, feeding the frecency signal.
 ///
@@ -2918,6 +3017,123 @@ mod tests {
         assert_eq!(parsed.chips[0].label, "PDF");
         assert_eq!(parsed.chips[0].token, "kind:pdf");
         assert_eq!(parsed.invalid, vec!["added:banana".to_string()]);
+    }
+
+    // MARK: - spotlight signals
+
+    #[test]
+    fn test_puller_is_incremental_and_does_not_retry_empty_results() {
+        let _scope = db_scope();
+        seed_twins();
+
+        let pending = paths_needing_signals(100);
+        assert_eq!(pending.len(), 2, "nothing pulled yet");
+
+        // Spotlight knew about one file and had nothing for the other.
+        record_signals(vec![
+            FileSignal {
+                path: "/tmp/a/notes.md".to_string(),
+                date_added: Some(1_700_000_000),
+                last_used_date: Some(1_700_000_000),
+                use_count: Some(7),
+            },
+            FileSignal {
+                path: "/tmp/b/notes.md".to_string(),
+                date_added: None,
+                last_used_date: None,
+                use_count: None,
+            },
+        ]);
+
+        assert!(
+            paths_needing_signals(100).is_empty(),
+            "a file Spotlight had nothing for must not be asked about forever"
+        );
+    }
+
+    #[test]
+    fn test_spotlight_date_added_overrides_birthtime() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        let long_ago = now - 86_400 * 400;
+        // Created a year ago, but moved into this folder today: Finder would
+        // say today, and birthtime alone would say a year ago.
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/moved.md', 'moved.md', '/tmp', 'md', 1, 0, ?1, ?2, 'Markdown', ?1)",
+            rusqlite::params![long_ago, long_ago],
+        )
+        .unwrap();
+
+        // Before the puller: falls back to birthtime, so it looks ancient.
+        assert!(get_recent_files(DateField::Added, 7).is_empty());
+
+        record_signals(vec![FileSignal {
+            path: "/tmp/moved.md".to_string(),
+            date_added: Some(now - 3_600),
+            last_used_date: None,
+            use_count: None,
+        }]);
+
+        let recent = get_recent_files(DateField::Added, 7);
+        assert_eq!(recent.len(), 1, "Spotlight's arrival date wins over birthtime");
+        assert_eq!(recent[0].file_name, "moved.md");
+    }
+
+    #[test]
+    fn test_added_filter_uses_the_same_date_as_sorting() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/moved.md', 'moved.md', '/tmp', 'md', 1, 0, ?1, ?1, 'Markdown', ?1)",
+            rusqlite::params![now - 86_400 * 400],
+        )
+        .unwrap();
+        record_signals(vec![FileSignal {
+            path: "/tmp/moved.md".to_string(),
+            date_added: Some(now - 3_600),
+            last_used_date: None,
+            use_count: None,
+        }]);
+
+        // The `added:` filter and the Added sort column must agree — they are
+        // defined in two different files and would silently drift otherwise.
+        assert_eq!(
+            search_files("added:<2d".to_string(), DateField::Added).len(),
+            1
+        );
+        assert!(search_files("added:>1y".to_string(), DateField::Added).is_empty());
+    }
+
+    #[test]
+    fn test_spotlight_seed_does_not_undo_our_own_open_tracking() {
+        let _scope = db_scope();
+        seed_twins();
+
+        // We recorded 5 opens; Spotlight later reports a smaller count.
+        for _ in 0..5 {
+            record_open("/tmp/a/notes.md".to_string());
+        }
+        record_signals(vec![FileSignal {
+            path: "/tmp/a/notes.md".to_string(),
+            date_added: Some(1_700_000_000),
+            last_used_date: Some(1),
+            use_count: Some(2),
+        }]);
+
+        let conn = db::open_default().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT use_count FROM file_signals s JOIN files f ON f.id = s.file_id
+                 WHERE f.path = '/tmp/a/notes.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 5, "a puller pass must not lower a count we observed");
     }
 
     // MARK: - frecency ranking
