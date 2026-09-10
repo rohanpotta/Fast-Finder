@@ -5,6 +5,7 @@ pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("migrations/0001_initial.sql")),
         M::up(include_str!("migrations/0002_birthtime.sql")),
+        M::up(include_str!("migrations/0003_date_added.sql")),
     ])
 }
 
