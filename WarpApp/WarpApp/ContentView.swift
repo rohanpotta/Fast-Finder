@@ -640,6 +640,20 @@ struct ContentView: View {
             handleFileChanges(batch)
         }
         fileWatcher.start(paths: roots, sinceEventId: resumeId)
+
+        // Backfill Spotlight metadata for anything newly indexed. Lowest
+        // priority and after the watcher is live: it's a ranking and
+        // date-quality improvement, never something the user waits on.
+        Task.detached(priority: .background) {
+            let updated = SpotlightSignals.runPass()
+            if updated > 0 {
+                await MainActor.run {
+                    // Date Added may have shifted for these files, so anything
+                    // sorted by it is now stale.
+                    if query.isEmpty && dateField == .added { refreshCurrentContent() }
+                }
+            }
+        }
     }
 
     /// Re-point the watcher after the indexed-folder list changes. Without this
@@ -677,6 +691,9 @@ struct ContentView: View {
             }
 
             guard changed else { return }
+            // Newly indexed files have no Spotlight metadata yet; the pass is
+            // incremental so this only touches what just arrived.
+            Task.detached(priority: .background) { SpotlightSignals.runPass() }
             await MainActor.run {
                 // Don't yank the list out from under an active search.
                 if query.isEmpty { refreshCurrentContent() }
