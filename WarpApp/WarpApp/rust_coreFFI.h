@@ -318,6 +318,11 @@ RustBuffer uniffi_rust_core_fn_func_rebuild_index(RustCallStatus *_Nonnull out_s
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_OPEN
+void uniffi_rust_core_fn_func_record_open(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RENAME_FILE
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RENAME_FILE
 RustBuffer uniffi_rust_core_fn_func_rename_file(RustBuffer path, RustBuffer new_name, RustCallStatus *_Nonnull out_status
@@ -690,6 +695,12 @@ uint16_t uniffi_rust_core_checksum_func_parse_query(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
 uint16_t uniffi_rust_core_checksum_func_rebuild_index(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_OPEN
+uint16_t uniffi_rust_core_checksum_func_record_open(void
     
 );
 #endif

@@ -1271,6 +1271,21 @@ public func rebuildIndex() -> [SearchResult]  {
 })
 }
 /**
+ * Record that the user opened a file, feeding the frecency signal.
+ *
+ * Only files already in the index can be recorded: `file_signals` is keyed on
+ * `files(id)` with ON DELETE CASCADE, so a row for an unindexed path would
+ * have nothing to hang from. Opening something outside the indexed folders is
+ * therefore silently not tracked, which is the right trade — the alternative
+ * is orphaned signal rows that outlive their files.
+ */
+public func recordOpen(path: String)  {try! rustCall() {
+    uniffi_rust_core_fn_func_record_open(
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+/**
  * Rename a file. `new_name` must be a basename (no `/`, no `..`).
  */
 public func renameFile(path: String, newName: String) -> FileOpResult  {
@@ -1401,6 +1416,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_rebuild_index() != 60778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_record_open() != 17553) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_rename_file() != 42280) {
