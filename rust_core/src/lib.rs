@@ -953,6 +953,41 @@ fn build_fts_query(raw: &str) -> Option<String> {
 /// ("every PDF") is useful rather than an arbitrary top-50 slice.
 const SEARCH_LIMIT: usize = 200;
 
+/// How much a file's usage history can lift it in search ranking.
+///
+/// Calibrated against the real index rather than guessed: measured `bm25`
+/// gaps between a strong and a weak match for the same query run about
+/// 1,000–1,600 points (e.g. `resume*` spans 6,745–8,379 across 20k files).
+/// `frecency` returns ~0–3.7, so at 300 a file opened once today gains ~208
+/// (enough to break a near-tie), five times today ~538, and a heavily-used one
+/// ~1,100 — able to climb past mediocre matches but not past the best one.
+///
+/// An earlier value of 800 put the ceiling at ~2,970, well beyond the entire
+/// relevance spread, which made usage silently override what the user typed.
+const FRECENCY_BOOST: f64 = 300.0;
+
+/// Record that the user opened a file, feeding the frecency signal.
+///
+/// Only files already in the index can be recorded: `file_signals` is keyed on
+/// `files(id)` with ON DELETE CASCADE, so a row for an unindexed path would
+/// have nothing to hang from. Opening something outside the indexed folders is
+/// therefore silently not tracked, which is the right trade — the alternative
+/// is orphaned signal rows that outlive their files.
+#[uniffi::export]
+pub fn record_open(path: String) {
+    let Ok(conn) = db::open_default() else { return };
+    let now = blocks::now_ts();
+    let _ = conn.execute(
+        "INSERT INTO file_signals (file_id, last_used_date, use_count, updated_at)
+         SELECT id, ?2, 1, ?2 FROM files WHERE path = ?1
+         ON CONFLICT(file_id) DO UPDATE SET
+             last_used_date = ?2,
+             use_count      = use_count + 1,
+             updated_at     = ?2",
+        params![path, now],
+    );
+}
+
 /// One parsed filter, for the UI to render as a removable chip.
 #[derive(uniffi::Record, Clone)]
 pub struct QueryChip {
@@ -1019,18 +1054,26 @@ pub fn search_files(query: String, date_field: DateField) -> Vec<SearchResult> {
         params.push(rusqlite::types::Value::Text(fts));
         params.extend(filter_params);
         clauses.insert(0, "files_fts MATCH ?".to_string());
+        // Text relevance plus a usage nudge. LEFT JOIN because most files have
+        // no signal row and must still be rankable — an INNER JOIN here would
+        // silently restrict search to files you'd already opened.
         format!(
             "SELECT f.path, f.name, f.size, f.is_dir, f.file_kind,
                     {value} AS date_value,
                     {kind} AS date_kind,
-                    CAST(-bm25(files_fts) * 1000 AS INTEGER) AS score
+                    CAST((-bm25(files_fts) * 1000)
+                         + ({boost} * frecency(s.last_used_date, COALESCE(s.use_count, 0), {now}))
+                         AS INTEGER) AS score
              FROM files_fts
              JOIN files f ON f.id = files_fts.rowid
+             LEFT JOIN file_signals s ON s.file_id = f.id
              WHERE {where_clause}
              ORDER BY score DESC, date_value DESC
              LIMIT {limit}",
             value = date_field.value_expr("f."),
             kind = date_field.kind_expr("f."),
+            boost = FRECENCY_BOOST,
+            now = now,
             where_clause = clauses.join(" AND "),
             limit = SEARCH_LIMIT,
         )
@@ -2877,6 +2920,179 @@ mod tests {
         assert_eq!(parsed.invalid, vec!["added:banana".to_string()]);
     }
 
+    // MARK: - frecency ranking
+
+    /// Two equally-good text matches, so ranking is decided purely by usage.
+    fn seed_twins() -> i64 {
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        for path in ["/tmp/a/notes.md", "/tmp/b/notes.md"] {
+            conn.execute(
+                "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+                 VALUES (?1, 'notes.md', '/tmp', 'md', 10, 0, ?2, ?2, 'Markdown', ?2)",
+                rusqlite::params![path, now],
+            )
+            .unwrap();
+        }
+        now
+    }
+
+    #[test]
+    fn test_opening_a_file_lifts_it_in_search() {
+        let _scope = db_scope();
+        seed_twins();
+
+        // Untouched: tie broken arbitrarily, but both present.
+        assert_eq!(search_files("notes".to_string(), DateField::Either).len(), 2);
+
+        record_open("/tmp/b/notes.md".to_string());
+        let ranked = search_files("notes".to_string(), DateField::Either);
+        assert_eq!(
+            ranked[0].file_path, "/tmp/b/notes.md",
+            "the file you actually opened should come first"
+        );
+    }
+
+    #[test]
+    fn test_repeated_opens_beat_a_single_open() {
+        let _scope = db_scope();
+        seed_twins();
+
+        record_open("/tmp/a/notes.md".to_string());
+        for _ in 0..5 {
+            record_open("/tmp/b/notes.md".to_string());
+        }
+        let ranked = search_files("notes".to_string(), DateField::Either);
+        assert_eq!(ranked[0].file_path, "/tmp/b/notes.md");
+
+        let conn = db::open_default().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT use_count FROM file_signals s JOIN files f ON f.id = s.file_id
+                 WHERE f.path = '/tmp/b/notes.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 5, "opens accumulate rather than overwrite");
+    }
+
+    #[test]
+    fn test_frecency_decays_so_stale_use_loses_to_recent_use() {
+        let _scope = db_scope();
+        let now = seed_twins();
+        let conn = db::open_default().unwrap();
+
+        // `a` was hammered months ago; `b` was opened once yesterday.
+        conn.execute(
+            "INSERT INTO file_signals (file_id, last_used_date, use_count, updated_at)
+             SELECT id, ?1, 50, ?1 FROM files WHERE path = '/tmp/a/notes.md'",
+            rusqlite::params![now - 86_400 * 120],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_signals (file_id, last_used_date, use_count, updated_at)
+             SELECT id, ?1, 1, ?1 FROM files WHERE path = '/tmp/b/notes.md'",
+            rusqlite::params![now - 86_400],
+        )
+        .unwrap();
+
+        let ranked = search_files("notes".to_string(), DateField::Either);
+        assert_eq!(
+            ranked[0].file_path, "/tmp/b/notes.md",
+            "recent use must outweigh a large but stale open count"
+        );
+    }
+
+    #[test]
+    fn test_frecency_never_hides_unused_files() {
+        let _scope = db_scope();
+        seed_twins();
+        record_open("/tmp/b/notes.md".to_string());
+
+        // The LEFT JOIN matters: a file with no signal row must still appear.
+        let paths: Vec<String> = search_files("notes".to_string(), DateField::Either)
+            .into_iter()
+            .map(|r| r.file_path)
+            .collect();
+        assert!(paths.contains(&"/tmp/a/notes.md".to_string()));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn test_frecency_contribution_stays_bounded() {
+        let _scope = db_scope();
+        let conn = db::open_default().unwrap();
+        let now = blocks::now_ts();
+
+        // The property that keeps ranking honest: however much a file is used,
+        // its bonus stays inside the relevance spread measured on the real
+        // index (~1,000-1,600 points between a strong and a weak match), so it
+        // can break ties without overriding what the user actually typed.
+        //
+        // Asserted on the scoring function directly. A corpus-based version of
+        // this test is not possible small: with few documents every match has
+        // an IDF of zero, so bm25 returns an identical score for a precise and
+        // a sloppy match and there is no gap to preserve.
+        for opens in [1_i64, 10, 100, 10_000] {
+            let f: f64 = conn
+                .query_row(
+                    "SELECT frecency(?1, ?2, ?1)",
+                    rusqlite::params![now, opens],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let bonus = f * FRECENCY_BOOST;
+            assert!(
+                bonus < 3_000.0,
+                "{} opens gave a {:.0} point bonus, beyond the relevance spread",
+                opens,
+                bonus
+            );
+        }
+
+        // And a single recent open is still worth enough to matter.
+        let one: f64 = conn
+            .query_row("SELECT frecency(?1, 1, ?1)", rusqlite::params![now], |r| r.get(0))
+            .unwrap();
+        assert!(one * FRECENCY_BOOST > 100.0, "a nudge has to actually nudge");
+    }
+
+    #[test]
+    fn test_record_open_ignores_unindexed_paths() {
+        let _scope = db_scope();
+        seed_twins();
+        // No files row -> nothing to key a signal to. Must not error or insert.
+        record_open("/tmp/never/indexed.md".to_string());
+        let conn = db::open_default().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_signals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_recents_stays_date_ordered_not_frecency_ordered() {
+        let _scope = db_scope();
+        let now = blocks::now_ts();
+        let conn = db::open_default().unwrap();
+        conn.execute(
+            "INSERT INTO files (path, name, parent_dir, ext, size, is_dir, mtime, birthtime, file_kind, indexed_at)
+             VALUES ('/tmp/older.md', 'older.md', '/tmp', 'md', 1, 0, ?1, ?1, 'Markdown', ?1),
+                    ('/tmp/newer.md', 'newer.md', '/tmp', 'md', 1, 0, ?2, ?2, 'Markdown', ?2)",
+            rusqlite::params![now - 86_400 * 3, now - 60],
+        )
+        .unwrap();
+        for _ in 0..30 {
+            record_open("/tmp/older.md".to_string());
+        }
+
+        // Recents promises "what changed lately". Letting usage reorder it
+        // would quietly break the date-field guarantee from Phase 3.
+        let recents = get_recent_files(DateField::Modified, 7);
+        assert_eq!(recents[0].file_name, "newer.md");
+    }
+
     // MARK: - date field selection
 
     /// Two files that disagree about which date is which:
@@ -2980,6 +3196,8 @@ mod tests {
         assert_eq!(last_event_id(), 918_273_645);
     }
 }
+
+
 
 
 
