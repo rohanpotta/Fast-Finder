@@ -854,6 +854,13 @@ struct ContentView: View {
     func openFile(_ path: String) {
         let url = URL(fileURLWithPath: path)
         NSWorkspace.shared.open(url)
+
+        // Feed the frecency signal. Off the main thread because it's a DB
+        // write, and fire-and-forget because failing to record an open must
+        // never delay or block actually opening the file.
+        Task.detached(priority: .utility) {
+            recordOpen(path: path)
+        }
     }
 
     func formattedDate(_ timestamp: Int64) -> String {
