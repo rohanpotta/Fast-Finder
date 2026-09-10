@@ -22,12 +22,52 @@ pub fn default_db_path() -> PathBuf {
     PathBuf::from(format!("{}/.fast-finder/index.sqlite3", home))
 }
 
+/// Half-life of a file's usage signal. Two weeks: long enough that last
+/// month's project still ranks, short enough that today's work wins.
+const FRECENCY_HALF_LIFE_DAYS: f64 = 14.0;
+
+/// Register `frecency(last_used_date, use_count, now)` so ranking can happen
+/// inside `ORDER BY` instead of after the fact.
+///
+/// This has to be a SQL function rather than a post-fetch sort: ranking decides
+/// which rows survive `LIMIT`, so computing it in Rust afterwards would only
+/// reorder an already-truncated list and the best result could be missing.
+///
+/// Returns 0.0 for a file that has never been opened, so unused files fall back
+/// to pure text relevance rather than being penalised into oblivion.
+fn register_frecency(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "frecency",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let last_used: Option<i64> = ctx.get(0)?;
+            let use_count: i64 = ctx.get(1).unwrap_or(0);
+            let now: i64 = ctx.get(2)?;
+
+            let Some(last_used) = last_used else { return Ok(0.0) };
+            if last_used <= 0 || use_count <= 0 {
+                return Ok(0.0);
+            }
+
+            let age_days = ((now - last_used).max(0) as f64) / 86_400.0;
+            let recency = 0.5_f64.powf(age_days / FRECENCY_HALF_LIFE_DAYS);
+            // log, not linear: the jump from 1 open to 5 should matter far more
+            // than 100 to 104, or a single hot file would bury everything.
+            let volume = (1.0 + use_count as f64).ln();
+            Ok(volume * recency)
+        },
+    )
+}
+
 pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
+    register_frecency(&conn)?;
     schema::apply(&mut conn)?;
     // The index contains a listing of every file the user has — treat it
     // as private. 0600 means owner-only read/write. Best-effort: on
