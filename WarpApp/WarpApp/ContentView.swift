@@ -133,10 +133,26 @@ struct ContentView: View {
 
             // --- DETAIL AREA ---
             VStack(spacing: 0) {
-                // One toolbar row: where you are on the left, how you're
-                // filtering on the right — the arrangement Finder uses and the
-                // thing reviewers praise ForkLift for keeping thin.
+                // Search owns the top row. It's the app's primary affordance,
+                // and sharing a row with the breadcrumb both demoted it and
+                // made the two compete for width — a long path squeezed the
+                // field down to something you couldn't type `kind:pdf
+                // added:<7d` into comfortably.
                 HStack(spacing: 10) {
+                    SearchBarView(
+                        query: $query,
+                        isNLDetected: isNLQuery,
+                        onSubmit: { handleSearchSubmit() }
+                    )
+                    DateFieldPicker(choice: $dateField)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: WarpTheme.toolbarHeight)
+                .background(WarpTheme.surfacePrimary)
+
+                // Where you are: secondary information, so a quiet thin strip
+                // rather than a peer of the search field.
+                HStack(spacing: 0) {
                     BreadcrumbBar(
                         sidebarItem: selectedSidebarItem,
                         navigationStack: navigationPathStack,
@@ -144,21 +160,9 @@ struct ContentView: View {
                             navigateToStackIndex(index)
                         }
                     )
-                    .layoutPriority(1)
-
-                    SearchBarView(
-                        query: $query,
-                        isNLDetected: isNLQuery,
-                        onSubmit: { handleSearchSubmit() }
-                    )
-                    // Flexible rather than fixed so a long breadcrumb and a
-                    // narrow window can't fight over the same points.
-                    .frame(minWidth: 170, idealWidth: 280, maxWidth: 320)
-
-                    DateFieldPicker(choice: $dateField)
                 }
                 .padding(.horizontal, 12)
-                .frame(height: WarpTheme.toolbarHeight)
+                .frame(height: WarpTheme.breadcrumbHeight)
                 .background(WarpTheme.surfacePrimary)
 
                 // Filters get their own row only when there are any — an

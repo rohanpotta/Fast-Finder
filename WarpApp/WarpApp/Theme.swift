@@ -47,8 +47,13 @@ enum WarpTheme {
     static let sidebarWidth: CGFloat = 196
     static let spacing: CGFloat = 8
 
-    /// Height of the single toolbar row (breadcrumb + search + date control).
+    /// Height of the search row — the app's primary affordance, so it gets
+    /// real presence rather than being squeezed in beside something else.
     static let toolbarHeight: CGFloat = 44
+
+    /// Height of the breadcrumb strip beneath it. Deliberately short and quiet:
+    /// "where you are" is context, not the main event.
+    static let breadcrumbHeight: CGFloat = 24
 }
 
 // MARK: - AppKit helpers
