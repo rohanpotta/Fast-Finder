@@ -36,11 +36,32 @@ enum WarpTheme {
     static let monoFont = Font.system(size: 12, weight: .regular, design: .monospaced)
 
     // MARK: - Dimensions
-    static let fileRowHeight: CGFloat = 36
-    static let iconSize: CGFloat = 20
+    ///
+    /// 28pt rows with 17pt icons. Was 36/20, which is comfortable for a launcher
+    /// showing five results and wasteful for a file manager: a file list's job
+    /// is to show files, and the taller row cost roughly a quarter of the
+    /// visible rows for no added legibility at 13pt text.
+    static let fileRowHeight: CGFloat = 28
+    static let iconSize: CGFloat = 17
     static let cornerRadius: CGFloat = 8
-    static let sidebarWidth: CGFloat = 200
+    static let sidebarWidth: CGFloat = 196
     static let spacing: CGFloat = 8
+
+    /// Height of the single toolbar row (breadcrumb + search + date control).
+    static let toolbarHeight: CGFloat = 44
+}
+
+// MARK: - AppKit helpers
+
+extension WarpTheme {
+    /// Monospaced digits for the size and date columns.
+    ///
+    /// Proportional figures make a column of numbers ragged because glyph
+    /// widths differ; tabular figures line the digits up so the column scans
+    /// vertically. This is the single cheapest legibility win in a file list.
+    static func columnFont(size: CGFloat = 11) -> NSFont {
+        NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)
+    }
 }
 
 // MARK: - NSColor Helpers

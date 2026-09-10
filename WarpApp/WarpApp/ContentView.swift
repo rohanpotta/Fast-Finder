@@ -133,32 +133,41 @@ struct ContentView: View {
 
             // --- DETAIL AREA ---
             VStack(spacing: 0) {
-                // Breadcrumb navigation
-                BreadcrumbBar(
-                    sidebarItem: selectedSidebarItem,
-                    navigationStack: navigationPathStack,
-                    onNavigateToIndex: { index in
-                        navigateToStackIndex(index)
-                    }
-                )
+                // One toolbar row: where you are on the left, how you're
+                // filtering on the right — the arrangement Finder uses and the
+                // thing reviewers praise ForkLift for keeping thin.
+                HStack(spacing: 10) {
+                    BreadcrumbBar(
+                        sidebarItem: selectedSidebarItem,
+                        navigationStack: navigationPathStack,
+                        onNavigateToIndex: { index in
+                            navigateToStackIndex(index)
+                        }
+                    )
+                    .layoutPriority(1)
 
-                Rectangle().fill(WarpTheme.divider).frame(height: 1)
-
-                // Search bar, with the date-field control alongside it
-                HStack(spacing: 8) {
                     SearchBarView(
                         query: $query,
                         isNLDetected: isNLQuery,
                         onSubmit: { handleSearchSubmit() }
                     )
-                    DateFieldPicker(choice: $dateField)
-                        .padding(.trailing, 12)
-                }
+                    // Flexible rather than fixed so a long breadcrumb and a
+                    // narrow window can't fight over the same points.
+                    .frame(minWidth: 170, idealWidth: 280, maxWidth: 320)
 
+                    DateFieldPicker(choice: $dateField)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: WarpTheme.toolbarHeight)
+                .background(WarpTheme.surfacePrimary)
+
+                // Filters get their own row only when there are any — an
+                // always-present row would be chrome charging rent for nothing.
                 if let parsed = parsedQuery {
                     FilterChipsBar(parsed: parsed, onRemove: { token in
                         removeFilterToken(token)
                     })
+                    .background(WarpTheme.surfacePrimary)
                 }
 
                 Rectangle().fill(WarpTheme.divider).frame(height: 1)
@@ -266,6 +275,11 @@ struct ContentView: View {
                     let paths = Array(selectedFileIds)
                     trashFilesNative(paths: paths)
                     return .handled
+                }
+                .overlay {
+                    if let reason = emptyStateReason {
+                        EmptyStateView(reason: reason)
+                    }
                 }
 
                 // Status Bar
@@ -377,6 +391,20 @@ struct ContentView: View {
     // Sorted results based on current sort order
     var sortedResults: [SearchResult] {
         results.sorted(using: sortOrder)
+    }
+
+    /// Why the list is empty, or nil when there's something to show.
+    private var emptyStateReason: EmptyStateView.Reason? {
+        guard results.isEmpty else { return nil }
+        if !query.isEmpty {
+            return .noSearchResults(query: query)
+        }
+        if selectedSidebarItem == .recents {
+            return .indexEmpty
+        }
+        let name = effectiveCurrentPath.map { ($0 as NSString).lastPathComponent }
+            ?? selectedSidebarItem.displayName
+        return .emptyFolder(name: name)
     }
 
     // MARK: - Search Submit (NL detection)
@@ -1354,13 +1382,16 @@ struct FileOutlineView: NSViewRepresentable {
                     txt.isBordered = false
                     txt.drawsBackground = false
                     txt.textColor = WarpTheme.nsTextSecondary
-                    txt.font = NSFont.systemFont(ofSize: 12)
+                    // Tabular figures, and sizes right-aligned so the digits
+                    // line up as a column instead of drifting with each value.
+                    txt.font = WarpTheme.columnFont()
+                    txt.alignment = columnId.rawValue == "size" ? .right : .left
                     cellView?.addSubview(txt)
                     txt.translatesAutoresizingMaskIntoConstraints = false
                     NSLayoutConstraint.activate([
                         txt.leadingAnchor.constraint(equalTo: cellView!.leadingAnchor, constant: 4),
                         txt.centerYAnchor.constraint(equalTo: cellView!.centerYAnchor),
-                        txt.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -4)
+                        txt.trailingAnchor.constraint(equalTo: cellView!.trailingAnchor, constant: -8)
                     ])
                     cellView?.textField = txt
                 }
@@ -1369,10 +1400,20 @@ struct FileOutlineView: NSViewRepresentable {
             if columnId.rawValue == "name" {
                 loadIcon(for: path, into: cellView)
                 cellView?.textField?.stringValue = file.fileName
+                // Folders carry slightly more weight: in a mixed listing the
+                // containers are the navigational landmarks.
+                cellView?.textField?.font = NSFont.systemFont(
+                    ofSize: 13,
+                    weight: file.isFolder ? .medium : .regular
+                )
                 cellView?.textField?.textColor = WarpTheme.nsTextPrimary
             } else if columnId.rawValue == "size" {
-                cellView?.textField?.stringValue = formatFileSize(file.fileSize)
-                cellView?.textField?.textColor = WarpTheme.nsTextSecondary
+                // A folder's byte count is its directory entry, not its
+                // contents, so showing it is just noise.
+                cellView?.textField?.stringValue = file.isFolder ? "--" : formatFileSize(file.fileSize)
+                cellView?.textField?.textColor = file.isFolder
+                    ? WarpTheme.nsTextTertiary
+                    : WarpTheme.nsTextSecondary
             } else if columnId.rawValue == "date" {
                 cellView?.textField?.stringValue = file.prettyDate
                 cellView?.textField?.textColor = WarpTheme.nsTextSecondary

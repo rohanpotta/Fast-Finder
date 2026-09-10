@@ -42,10 +42,11 @@ struct BreadcrumbBar: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(WarpTheme.surfacePrimary)
+        // No padding or background of its own any more: this now sits inside
+        // the shared toolbar row rather than owning a full-width bar. Three
+        // stacked bars (path, search, filters) pushed the file list ~100pt down
+        // the window before a single file was visible.
     }
 }

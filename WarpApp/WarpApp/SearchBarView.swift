@@ -48,22 +48,22 @@ struct SearchBarView: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        // Sized to sit inside the toolbar row rather than own a bar: a search
+        // field is a control, not a section header.
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 7)
                 .fill(WarpTheme.surfaceSecondary)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
+                    RoundedRectangle(cornerRadius: 7)
                         .stroke(
                             isFocused ? WarpTheme.accent.opacity(0.6) : WarpTheme.divider,
-                            lineWidth: isFocused ? 1.5 : 1
+                            lineWidth: 1
                         )
                 )
-                .shadow(color: isFocused ? WarpTheme.accentGlow : .clear, radius: 8)
+                .shadow(color: isFocused ? WarpTheme.accentGlow : .clear, radius: 6)
         )
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .animation(.easeInOut(duration: 0.2), value: isFocused)
         .animation(.easeInOut(duration: 0.2), value: isNLDetected)
     }
