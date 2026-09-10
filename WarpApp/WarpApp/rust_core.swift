@@ -606,6 +606,90 @@ public func FfiConverterTypeFileOpResult_lower(_ value: FileOpResult) -> RustBuf
 
 
 /**
+ * Metadata Spotlight knows about a file that the filesystem alone doesn't.
+ *
+ * `None` means "Spotlight had no value", which is distinct from zero and gets
+ * stored as the 0 sentinel so the puller doesn't keep re-asking.
+ */
+public struct FileSignal: Equatable, Hashable {
+    public var path: String
+    /**
+     * kMDItemDateAdded — when the file arrived in its current folder.
+     */
+    public var dateAdded: Int64?
+    /**
+     * kMDItemLastUsedDate — when it was last opened, by any app.
+     */
+    public var lastUsedDate: Int64?
+    /**
+     * kMDItemUseCount — how often, according to the system.
+     */
+    public var useCount: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, 
+        /**
+         * kMDItemDateAdded — when the file arrived in its current folder.
+         */dateAdded: Int64?, 
+        /**
+         * kMDItemLastUsedDate — when it was last opened, by any app.
+         */lastUsedDate: Int64?, 
+        /**
+         * kMDItemUseCount — how often, according to the system.
+         */useCount: Int64?) {
+        self.path = path
+        self.dateAdded = dateAdded
+        self.lastUsedDate = lastUsedDate
+        self.useCount = useCount
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension FileSignal: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileSignal: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileSignal {
+        return
+            try FileSignal(
+                path: FfiConverterString.read(from: &buf), 
+                dateAdded: FfiConverterOptionInt64.read(from: &buf), 
+                lastUsedDate: FfiConverterOptionInt64.read(from: &buf), 
+                useCount: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FileSignal, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterOptionInt64.write(value.dateAdded, into: &buf)
+        FfiConverterOptionInt64.write(value.lastUsedDate, into: &buf)
+        FfiConverterOptionInt64.write(value.useCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileSignal_lift(_ buf: RustBuffer) throws -> FileSignal {
+    return try FfiConverterTypeFileSignal.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileSignal_lower(_ value: FileSignal) -> RustBuffer {
+    return FfiConverterTypeFileSignal.lower(value)
+}
+
+
+/**
  * Outcome of changing the folder list, so the UI can report what happened
  * instead of silently succeeding.
  */
@@ -1033,6 +1117,30 @@ public func FfiConverterTypeDateField_lower(_ value: DateField) -> RustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -1050,6 +1158,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFileSignal: FfiConverterRustBuffer {
+    typealias SwiftType = [FileSignal]
+
+    public static func write(_ value: [FileSignal], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFileSignal.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FileSignal] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FileSignal]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFileSignal.read(from: &buf))
         }
         return seq
     }
@@ -1260,6 +1393,21 @@ public func parseQuery(raw: String) -> ParsedQuery  {
 })
 }
 /**
+ * Indexed files that have never been through the Spotlight puller.
+ *
+ * `date_added IS NULL` is the "not yet asked" marker; a file Spotlight had
+ * nothing for gets 0, so it isn't retried on every pass. That makes the puller
+ * naturally incremental: the first run covers the index, later runs only pick
+ * up newly indexed files.
+ */
+public func pathsNeedingSignals(limit: UInt32) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_paths_needing_signals(
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+/**
  * Full rescan of every scan root. Expensive: this walks the whole tree, so
  * the app should call it on first run or when the incremental event stream
  * has gone stale — `index_paths` handles the steady state.
@@ -1284,6 +1432,20 @@ public func recordOpen(path: String)  {try! rustCall() {
         FfiConverterString.lower(path),$0
     )
 }
+}
+/**
+ * Fold a batch of Spotlight readings into the index.
+ *
+ * Usage counters are merged with `MAX` rather than overwritten: the app's own
+ * `record_open` tracking and Spotlight's system-wide counts are both partial
+ * views, and a later puller pass must not undo opens we recorded ourselves.
+ */
+public func recordSignals(signals: [FileSignal]) -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rust_core_fn_func_record_signals(
+        FfiConverterSequenceTypeFileSignal.lower(signals),$0
+    )
+})
 }
 /**
  * Rename a file. `new_name` must be a basename (no `/`, no `..`).
@@ -1415,10 +1577,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_rust_core_checksum_func_parse_query() != 11403) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rust_core_checksum_func_paths_needing_signals() != 26326) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rust_core_checksum_func_rebuild_index() != 60778) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_record_open() != 17553) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rust_core_checksum_func_record_signals() != 24207) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rust_core_checksum_func_rename_file() != 42280) {

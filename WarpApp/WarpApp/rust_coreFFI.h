@@ -312,6 +312,11 @@ int8_t uniffi_rust_core_fn_func_needs_full_rescan(RustCallStatus *_Nonnull out_s
 RustBuffer uniffi_rust_core_fn_func_parse_query(RustBuffer raw, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_PATHS_NEEDING_SIGNALS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_PATHS_NEEDING_SIGNALS
+RustBuffer uniffi_rust_core_fn_func_paths_needing_signals(uint32_t limit, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_REBUILD_INDEX
 RustBuffer uniffi_rust_core_fn_func_rebuild_index(RustCallStatus *_Nonnull out_status
@@ -321,6 +326,11 @@ RustBuffer uniffi_rust_core_fn_func_rebuild_index(RustCallStatus *_Nonnull out_s
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_OPEN
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_OPEN
 void uniffi_rust_core_fn_func_record_open(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_SIGNALS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RECORD_SIGNALS
+uint32_t uniffi_rust_core_fn_func_record_signals(RustBuffer signals, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_FN_FUNC_RENAME_FILE
@@ -692,6 +702,12 @@ uint16_t uniffi_rust_core_checksum_func_parse_query(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_PATHS_NEEDING_SIGNALS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_PATHS_NEEDING_SIGNALS
+uint16_t uniffi_rust_core_checksum_func_paths_needing_signals(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_REBUILD_INDEX
 uint16_t uniffi_rust_core_checksum_func_rebuild_index(void
@@ -701,6 +717,12 @@ uint16_t uniffi_rust_core_checksum_func_rebuild_index(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_OPEN
 #define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_OPEN
 uint16_t uniffi_rust_core_checksum_func_record_open(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_SIGNALS
+#define UNIFFI_FFIDEF_UNIFFI_RUST_CORE_CHECKSUM_FUNC_RECORD_SIGNALS
+uint16_t uniffi_rust_core_checksum_func_record_signals(void
     
 );
 #endif
