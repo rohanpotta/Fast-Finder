@@ -6,28 +6,32 @@ struct StatusBar: View {
     let selectedSize: UInt64
 
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text("\(fileCount) item\(fileCount == 1 ? "" : "s")")
                 .font(WarpTheme.captionFont)
                 .foregroundColor(WarpTheme.textTertiary)
 
             if selectedCount > 0 {
-                Text("  |  ")
-                    .foregroundColor(WarpTheme.textTertiary)
+                // A drawn separator rather than "  |  " as text, which
+                // inherited the surrounding font and never sat on the baseline.
+                Rectangle()
+                    .fill(WarpTheme.divider)
+                    .frame(width: 1, height: 9)
+
                 Text("\(selectedCount) selected")
                     .font(WarpTheme.captionFont)
                     .foregroundColor(WarpTheme.textSecondary)
                 if selectedSize > 0 {
-                    Text("(\(formatSize(selectedSize)))")
-                        .font(WarpTheme.captionFont)
+                    Text(formatSize(selectedSize))
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(WarpTheme.textTertiary)
                 }
             }
 
             Spacer()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .frame(height: 22)
         .background(WarpTheme.surfacePrimary)
     }
 

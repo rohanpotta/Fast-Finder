@@ -44,18 +44,21 @@ struct SidebarView: View {
         let isSelected = selectedItem == item
         let isHovered = hoveredItem == item
 
-        return HStack(spacing: 8) {
+        return HStack(spacing: 7) {
             Image(systemName: item.icon)
                 .font(.system(size: 13))
-                .foregroundColor(isSelected ? WarpTheme.accent : WarpTheme.textSecondary)
-                .frame(width: 18)
+                // Selected rows read as one object: the icon stops competing
+                // with the label for attention once the row itself is tinted.
+                .foregroundColor(isSelected ? WarpTheme.textPrimary : WarpTheme.accent.opacity(0.75))
+                .frame(width: 17)
             Text(item.displayName)
-                .font(WarpTheme.bodyFont)
+                .font(.system(size: 13, weight: isSelected ? .medium : .regular))
                 .foregroundColor(isSelected ? WarpTheme.textPrimary : WarpTheme.textSecondary)
-            Spacer()
+                .lineLimit(1)
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(isSelected ? WarpTheme.surfaceSelected : (isHovered ? WarpTheme.surfaceHover : Color.clear))
